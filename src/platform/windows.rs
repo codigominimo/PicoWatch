@@ -1,13 +1,17 @@
-//! Enlazado mínimo a Win32 (kernel32), sin crates externos.
+//! Enlazado mínimo a Win32 (`kernel32`, `iphlpapi`, `ntdll`), sin crates externos.
 //!
 //! Justificación del `unsafe`: no existe API en `std` para obtener los
-//! contadores del sistema. Se usan tres funciones documentadas por Microsoft,
-//! con estructuras `#[repr(C)]` y sin punteros devueltos por la API, de modo
-//! que el riesgo se limita a las llamadas FFI siguientes.
+//! contadores del sistema. Se usan funciones documentadas por Microsoft, con
+//! estructuras `#[repr(C)]` y sin punteros devueltos por la API, de modo que
+//! el riesgo se limita a las llamadas FFI siguientes. La única excepción es
+//! `NtQuerySystemInformation`: no hay equivalente documentado para los
+//! contadores por núcleo, y su clase 8 y su estructura llevan décadas
+//! estables (están declaradas en `winternl.h` del SDK).
 
 use std::ffi::c_void;
 use std::io;
 use std::mem::{size_of, zeroed};
+use std::ptr;
 
 /// `FILETIME`: 100 ns desde 1601-01-01, dividido en dos palabras de 32 bits.
 #[repr(C)]
@@ -41,6 +45,15 @@ pub struct MemoryStatusEx {
 extern "system" {
     #[link_name = "GetSystemTimes"]
     fn get_system_times(idle: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+
+    #[link_name = "GetProcessTimes"]
+    fn get_process_times(
+        process: *mut c_void,
+        creation: *mut FileTime,
+        exit: *mut FileTime,
+        kernel: *mut FileTime,
+        user: *mut FileTime,
+    ) -> i32;
 
     #[link_name = "GlobalMemoryStatusEx"]
     fn global_memory_status_ex(status: *mut MemoryStatusEx) -> i32;
@@ -92,6 +105,104 @@ pub fn cpu_times() -> io::Result<(u64, u64, u64)> {
         return Err(io::Error::last_os_error());
     }
     Ok((user.as_u64(), kernel.as_u64(), idle.as_u64()))
+}
+
+/// `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` (`winternl.h`): 0x30 bytes en
+/// x86, x64 y ARM64. Sólo se consultan los tres primeros contadores; el resto
+/// del registro se conserva para mantener el paso de 48 bytes entre entradas.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcessorPerformance {
+    idle: i64,
+    kernel: i64,
+    user: i64,
+    _dpc: i64,
+    _interrupt: i64,
+    _count: u32,
+    _padding: u32,
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    #[link_name = "NtQuerySystemInformation"]
+    fn nt_query_system_information(
+        class: u32,
+        information: *mut c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
+}
+
+/// Convierte las entradas devueltas por el kernel a `(usuario, kernel, idle)`.
+///
+/// Al igual que `GetSystemTimes`, el `KernelTime` de esta estructura incluye
+/// el `IdleTime`: se resta para no contar dos veces la inactividad. Se comprueba
+/// con el agregado: la suma de los `kernel` por núcleo coincide con el `kernel`
+/// de `GetSystemTimes`, no con `kernel - idle`. Función pura y portable.
+fn processor_times(entries: &[ProcessorPerformance]) -> Vec<(u64, u64, u64)> {
+    entries
+        .iter()
+        .map(|entry| {
+            let idle = entry.idle.max(0) as u64;
+            let kernel = (entry.kernel.max(0) as u64).saturating_sub(idle);
+            (entry.user.max(0) as u64, kernel, idle)
+        })
+        .collect()
+}
+
+/// Contadores `(usuario, kernel, idle)` de cada procesador lógico.
+///
+/// `GetSystemTimes` sólo da el agregado y no existe equivalente documentado
+/// por núcleo. Se consulta la clase 8 de `NtQuerySystemInformation`, que el
+/// SDK declara en `winternl.h` y que devuelve una entrada fija de 48 bytes por
+/// procesador del grupo actual. El tamaño se pregunta primero para no asumir
+/// un número máximo de núcleos.
+pub fn cpu_core_times() -> io::Result<Vec<(u64, u64, u64)>> {
+    const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+    const ENTRY_SIZE: usize = std::mem::size_of::<ProcessorPerformance>();
+
+    let mut length = 0u32;
+    // SAFETY: `length` es válido; con `information` nulo y longitud 0 la API
+    // sólo informa del tamaño necesario a través de `length`.
+    let status = unsafe {
+        nt_query_system_information(
+            SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
+            ptr::null_mut(),
+            0,
+            &mut length,
+        )
+    };
+    if status != STATUS_INFO_LENGTH_MISMATCH || length as usize % ENTRY_SIZE != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // `u64` garantiza la alineación de 8 bytes que exigen los LARGE_INTEGER.
+    let mut storage = vec![0u64; (length as usize + 7) / 8];
+    let mut returned = 0u32;
+    // SAFETY: el buffer es alineado y tiene exactamente el tamaño que acaba
+    // de pedir la API; `returned` apila una variable válida.
+    let status = unsafe {
+        nt_query_system_information(
+            SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
+            storage.as_mut_ptr().cast::<c_void>(),
+            length,
+            &mut returned,
+        )
+    };
+    if status != 0 || returned as usize % ENTRY_SIZE != 0 || returned as usize > storage.len() * 8 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: la API rellenó `returned / ENTRY_SIZE` registros contiguos
+    // dentro del buffer alineado; se leen dentro de los límites devueltos.
+    let entries = unsafe {
+        std::slice::from_raw_parts(
+            storage.as_ptr().cast::<ProcessorPerformance>(),
+            returned as usize / ENTRY_SIZE,
+        )
+    };
+    Ok(processor_times(entries))
 }
 
 /// Devuelve `(total, disponible)` en bytes de memoria física.
@@ -175,9 +286,6 @@ extern "system" {
 
 /// Contadores RX/TX de las interfaces del sistema.
 pub fn interfaces() -> io::Result<Vec<crate::collectors::network::Interface>> {
-    use std::ffi::c_void;
-    use std::ptr;
-
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
     // Primera llamada: sólo consulta el tamaño necesario.
@@ -262,36 +370,65 @@ fn utf16_until_nul(chars: &[u16]) -> String {
     String::from_utf16_lossy(&chars[..len])
 }
 
-/// Working set (RSS) de un PID, o cero si no se puede consultar.
-fn working_set(pid: u32) -> u64 {
+/// Contadores de un PID: working set (bytes) y tiempo de CPU (100 ns).
+///
+/// Se abre un único handle para ambas consultas: antes se abría uno sólo para
+/// la memoria, y abrir otro para el tiempo duplicaría las llamadas por PID y
+/// por muestra. Si una consulta falla, su campo queda a cero.
+fn process_counters(pid: u32) -> (u64, u64) {
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
     // SAFETY: `OpenProcess` no recibe punteros de usuario; un handle inválido
     // se detecta antes de usarlo.
     let handle = unsafe { open_process(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if is_invalid_handle(handle) {
-        return 0;
+        return (0, 0);
     }
 
     // SAFETY: estructura POD alineada; `cb` se fija antes de la llamada.
-    let mut counters: ProcessMemoryCounters = unsafe { zeroed() };
-    counters.size = size_of::<ProcessMemoryCounters>() as u32;
+    let mut memory: ProcessMemoryCounters = unsafe { zeroed() };
+    memory.size = size_of::<ProcessMemoryCounters>() as u32;
+    let mut creation = FileTime::default();
+    let mut exit = FileTime::default();
+    let mut kernel = FileTime::default();
+    let mut user = FileTime::default();
 
     // SAFETY: el handle es válido y la estructura tiene el tamaño declarado.
-    let ok = unsafe { get_process_memory_info(handle, &mut counters, counters.size) };
+    let ok_memory = unsafe { get_process_memory_info(handle, &mut memory, memory.size) };
+    // SAFETY: mismo handle válido; los cuatro punteros apilan `FileTime`s
+    // inicializadas y la API sólo las escribe.
+    let ok_times =
+        unsafe { get_process_times(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
 
     // SAFETY: el handle fue abierto por `OpenProcess` y no se guarda.
     unsafe { close_handle(handle) };
 
-    if ok == 0 {
+    let rss = if ok_memory == 0 {
         0
     } else {
-        counters.working_set_size as u64
-    }
+        memory.working_set_size as u64
+    };
+    // `GetProcessTimes` da el tiempo acumulado de kernel y de usuario en
+    // unidades de 100 ns; dos muestras permiten derivar el porcentaje.
+    let cpu = if ok_times == 0 {
+        0
+    } else {
+        kernel.as_u64().saturating_add(user.as_u64())
+    };
+    (rss, cpu)
 }
 
-/// Lista de procesos del sistema mediante Toolhelp32.
-pub fn processes() -> io::Result<Vec<crate::collectors::processes::Process>> {
+/// Muestra intermedia de un proceso con su contador de CPU acumulado.
+pub struct ProcessSample {
+    pub pid: u32,
+    pub name: String,
+    pub threads: u32,
+    pub rss_bytes: u64,
+    pub cpu_100ns: u64,
+}
+
+/// Enumera los procesos con Toolhelp32 y lee sus contadores acumulados.
+fn snapshot() -> io::Result<Vec<ProcessSample>> {
     const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 
     // SAFETY: flags y PID son escalares; el handle se valida a continuación.
@@ -309,12 +446,13 @@ pub fn processes() -> io::Result<Vec<crate::collectors::processes::Process>> {
     // SAFETY: `entry` y `snapshot` son válidos durante la llamada.
     let mut more = unsafe { process32_first_w(snapshot, &mut entry) } != 0;
     while more {
-        result.push(crate::collectors::processes::Process {
+        let (rss_bytes, cpu_100ns) = process_counters(entry.pid);
+        result.push(ProcessSample {
             pid: entry.pid,
             name: utf16_until_nul(&entry.exe_file),
             threads: entry.threads,
-            rss_bytes: working_set(entry.pid),
-            cpu_basis_points: 0,
+            rss_bytes,
+            cpu_100ns,
         });
         // SAFETY: misma precondition que `Process32FirstW`.
         more = unsafe { process32_next_w(snapshot, &mut entry) } != 0;
@@ -325,15 +463,76 @@ pub fn processes() -> io::Result<Vec<crate::collectors::processes::Process>> {
     Ok(result)
 }
 
+/// Instantánea de procesos para calcular CPU entre dos muestras.
+pub fn process_samples() -> io::Result<Vec<ProcessSample>> {
+    snapshot()
+}
+
+/// Lista de procesos del sistema, sin calcular CPU.
+pub fn processes() -> io::Result<Vec<crate::collectors::processes::Process>> {
+    Ok(snapshot()?
+        .into_iter()
+        .map(|sample| crate::collectors::processes::Process {
+            pid: sample.pid,
+            name: sample.name,
+            threads: sample.threads,
+            rss_bytes: sample.rss_bytes,
+            cpu_basis_points: 0,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cpu_times, disk_bytes, interfaces, memory_bytes, processes};
+    use super::{
+        cpu_core_times, cpu_times, disk_bytes, interfaces, memory_bytes, process_samples,
+        processes, processor_times, ProcessorPerformance,
+    };
+
+    #[test]
+    fn kernel_por_nucleo_incluye_idle() {
+        let entries = [
+            ProcessorPerformance {
+                idle: 40,
+                kernel: 100,
+                user: 60,
+                _dpc: 0,
+                _interrupt: 0,
+                _count: 0,
+                _padding: 0,
+            },
+            ProcessorPerformance {
+                idle: 10,
+                kernel: 30,
+                user: 20,
+                _dpc: 0,
+                _interrupt: 0,
+                _count: 0,
+                _padding: 0,
+            },
+        ];
+        assert_eq!(processor_times(&entries), vec![(60, 60, 40), (20, 20, 10)]);
+    }
 
     #[test]
     fn win32_devuelve_contadores_de_cpu() {
         let (user, kernel, idle) = cpu_times().unwrap();
         assert!(user > 0 || kernel > 0, "sin tiempo de CPU acumulado");
         assert!(idle <= kernel, "idle debería estar incluido en kernel");
+    }
+
+    #[test]
+    fn nucleos_son_coherentes_con_el_agregado() {
+        let cores = cpu_core_times().unwrap();
+        let (user, kernel, idle) = cpu_times().unwrap();
+        assert!(!cores.is_empty(), "sin contadores por núcleo");
+
+        // Las dos APIs se leen con microsegundos de diferencia: basta con una
+        // tolerancia del 1 % sobre contadores acumulados de horas.
+        let near = |sum: u64, total: u64| sum.abs_diff(total) * 100 <= total.max(1);
+        assert!(near(cores.iter().map(|core| core.0).sum(), user));
+        assert!(near(cores.iter().map(|core| core.1).sum(), kernel - idle));
+        assert!(near(cores.iter().map(|core| core.2).sum(), idle));
     }
 
     #[test]
@@ -364,5 +563,12 @@ mod tests {
         assert!(!list.is_empty());
         assert!(list.iter().any(|process| !process.name.is_empty()));
         assert!(list.iter().any(|process| process.rss_bytes > 0));
+    }
+
+    #[test]
+    fn win32_devuelve_tiempo_acumulado_por_proceso() {
+        let list = process_samples().unwrap();
+        assert!(!list.is_empty());
+        assert!(list.iter().any(|sample| sample.cpu_100ns > 0));
     }
 }

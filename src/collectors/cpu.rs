@@ -195,14 +195,22 @@ pub fn read() -> io::Result<CpuSnapshot> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
-/// Obtiene los contadores del sistema mediante `GetSystemTimes`.
-///
-/// Windows sólo ofrece el agregado del sistema; el por núcleo se deja vacío
-/// porque la API equivalente (PDH) añadiría una dependencia pesada. La CLI
-/// imprime el total y omite la lista de núcleos.
+/// Obtiene los contadores agregados con `GetSystemTimes` y los de cada núcleo
+/// con la clase 8 de `NtQuerySystemInformation` (no hay equivalente documentado
+/// por núcleo). En ambos casos `kernel` incluye `idle` y se resta para no
+/// contar dos veces el tiempo de inactividad.
 #[cfg(target_os = "windows")]
 pub fn read() -> io::Result<CpuSnapshot> {
     let (user, kernel, idle) = crate::platform::windows::cpu_times()?;
+    let cores = crate::platform::windows::cpu_core_times()?
+        .into_iter()
+        .map(|(user, system, idle)| CpuTimes {
+            user,
+            system,
+            idle,
+            ..CpuTimes::default()
+        })
+        .collect();
     Ok(CpuSnapshot {
         total: CpuTimes {
             user,
@@ -210,7 +218,7 @@ pub fn read() -> io::Result<CpuSnapshot> {
             idle,
             ..CpuTimes::default()
         },
-        cores: Vec::new(),
+        cores,
     })
 }
 

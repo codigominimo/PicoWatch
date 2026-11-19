@@ -2,7 +2,7 @@
 
 Monitor de sistemas extremadamente ligero, escrito en Rust estable y sin dependencias externas. Funciona en **Windows y Linux**, en **x86 y ARM**.
 
-**Estado:** Fase 7 completada (optimización medida y benchmarking automatizado). 88 pruebas unitarias en verde.
+**Estado:** Fase 8 completada (limitaciones de Windows eliminadas sin dependencias). 92 pruebas unitarias en verde.
 
 ---
 
@@ -25,9 +25,9 @@ Monitor de sistemas extremadamente ligero, escrito en Rust estable y sin depende
 | Sistema | Arquitecturas | Backend | Limitación |
 | --- | --- | --- | --- |
 | Linux | x86_64, i686, aarch64, armv7 | `/proc`, `/sys`, `statvfs`, `sysconf` | Ninguna de las métricas implementadas. |
-| Windows | x86_64, i686, aarch64 | `kernel32`, `iphlpapi`, Toolhelp32 | No hay API térmica ligera: `temperature` devuelve `Unsupported` y `status` muestra «no disponible en esta plataforma». El uso de CPU por proceso se muestra a `0.00%`. |
+| Windows | x86_64, i686, aarch64 | `kernel32`, `iphlpapi`, `ntdll`, Toolhelp32 | Sin sensores térmicos: la única fuente es WMI/COM. `temperature` informa «sin sensores disponibles» y `status` omite la sección de alertas térmicas. |
 
-En Windows el porcentaje de CPU por núcleo no se ofrece: `GetSystemTimes` sólo da el agregado y la alternativa (PDH) añadiría una dependencia pesada. Tampoco se calcula CPU por proceso: exigiría abrir dos veces el handle de cada PID con `QueryProcessCycleTime`. En Linux ambos desgloses sí están disponibles y el porcentaje de proceso es relativo a un núcleo, como en `top`.
+En Windows **sí** se ofrece el desglose de CPU por núcleo y por proceso (Fase 8): `GetSystemTimes` sólo da el agregado, así que los núcleos se leen con la clase 8 de `NtQuerySystemInformation` (`winternl.h`, estable desde Windows NT) y el tiempo por proceso con `GetProcessTimes`, tomando dos muestras como en Linux. No se usa PDH: añadiría un query, rutas de contador sensibles al idioma y aritmética de coma flotante. El porcentaje de proceso es relativo a un núcleo, igual que en `top`. Para la temperatura no existe API ligera equivalente a sysfs: WMI/COM exigiría cientos de líneas y una dependencia de runtime que no se puede validar en este entorno, así que se devuelve una lista vacía en lugar de un error.
 
 ---
 
@@ -47,12 +47,12 @@ picowatch/
 │   │   └── mod.rs         # Command, ParseError, parse() puro y testeable
 │   ├── collectors/
 │   │   ├── mod.rs
-│   │   ├── cpu.rs         # /proc/stat | GetSystemTimes
+│   │   ├── cpu.rs         # /proc/stat | GetSystemTimes + NtQuerySystemInformation
 │   │   ├── memory.rs      # /proc/meminfo | GlobalMemoryStatusEx
 │   │   ├── disk.rs        # statvfs | GetDiskFreeSpaceExW
-│   │   ├── temperature.rs # /sys/class/thermal (sysfs)
+│   │   ├── temperature.rs # /sys/class/thermal (sysfs); vacío en Windows
 │   │   ├── network.rs     # /proc/net/dev | GetIfTable
-│   │   └── processes.rs   # /proc/[pid]/stat | Toolhelp32
+│   │   └── processes.rs   # /proc/[pid]/stat | Toolhelp32 + GetProcessTimes
 │   ├── config/
 │   │   └── mod.rs         # clave=valor, rutas por plataforma
 │   ├── core/
@@ -63,7 +63,7 @@ picowatch/
 │   │   └── terminal.rs    # funciones Write genérico para todos los comandos
 │   ├── platform/
 │   │   ├── mod.rs
-│   │   └── windows.rs     # FFI a kernel32, iphlpapi y Toolhelp32 (cfg windows)
+│   │   └── windows.rs     # FFI a kernel32, iphlpapi, ntdll y Toolhelp32 (cfg windows)
 │   ├── storage/
 │   │   └── mod.rs         # historial TSV acotado
 │   └── watchdog/
@@ -101,10 +101,10 @@ Responsabilidades:
 | `clap` | Parseo de CLI | Cientos de KiB y asignaciones para comandos fijos. |
 | `serde` / `serde_json` | Salida JSON | Se resolvió en la Fase 6 con `output::json`: ~7-12 KB frente a cientos de KiB. |
 | `sysinfo` | Métricas del sistema | Arrastre de dependencias y allocations; `/proc`, `/sys` y la API nativa se usan directamente. |
-| `libc` | Llamadas al sistema | Añadiría un crate y una capa que no evita declarar las estructuras (`statvfs`, `PROCESSENTRY32W`) ni las funciones de Windows. Se declaran las doce funciones necesarias. |
+| `libc` | Llamadas al sistema | Añadiría un crate y una capa que no evita declarar las estructuras (`statvfs`, `PROCESSENTRY32W`) ni las funciones de Windows. Se declaran las catorce funciones necesarias. |
 | `anyhow` / `thiserror` | Errores | Un enum de dos variantes y `From` bastan. |
 
-Las funciones declaradas mediante FFI son `GetSystemTimes`, `GlobalMemoryStatusEx`, `GetDiskFreeSpaceExW`, `GetIfTable`, `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW`, `OpenProcess`, `K32GetProcessMemoryInfo` y `CloseHandle` (Windows), y `statvfs` y `sysconf` (Linux). `std` no expone estas métricas y la alternativa de lanzar `wmic`/`tasklist`/`df`/PowerShell sería lenta, dependiente de la configuración regional y frágil. Cada bloque `unsafe` está acompañado de un comentario `SAFETY`; no hay `unsafe` en el parseo ni en la lógica de presentación. Los handles se cierran siempre, incluso cuando la consulta de memoria falla.
+Las funciones declaradas mediante FFI son `GetSystemTimes`, `GetProcessTimes`, `GlobalMemoryStatusEx`, `GetDiskFreeSpaceExW`, `GetIfTable`, `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW`, `OpenProcess`, `K32GetProcessMemoryInfo`, `CloseHandle` y `NtQuerySystemInformation` (Windows), y `statvfs` y `sysconf` (Linux). Todas son API del sistema: no se añade ningún crate ni DLL externa. `std` no expone estas métricas y la alternativa de lanzar `wmic`/`tasklist`/`df`/PowerShell sería lenta, dependiente de la configuración regional y frágil. Cada bloque `unsafe` está acompañado de un comentario `SAFETY`; no hay `unsafe` en el parseo ni en la lógica de presentación. Los handles se cierran siempre, incluso cuando falla alguna de las dos consultas por proceso, que comparten un único `OpenProcess`.
 
 Criterio para incorporar cualquier dependencia futura: describir el problema, demostrar que implementarlo directamente no es fiable, medir el incremento de binario y de RAM, y documentarlo aquí antes del `Cargo.toml`.
 
@@ -217,14 +217,23 @@ Ejemplo en Windows:
 
 ```console
 > picowatch temperature
-picowatch: error de E/S: los sensores térmicos sólo están disponibles en Linux (sysfs)
+Temperatura: sin sensores disponibles
+> picowatch cpu
+CPU: 5.40%
+Núcleos: 12
+  cpu0: 0.00%
+  cpu1: 0.00%
+  cpu2: 16.66%
+  ...
 > picowatch status
 ...
-Temperatura: no disponible en esta plataforma
+Temperatura: sin sensores disponibles
 Red: 45 interfaces
 > picowatch processes
-Procesos: 267
-    23744  opencode-cli.exe         420.4 MiB  27 hilos  0.00%
+Procesos: 268
+     6016  msedge.exe               179.6 MiB  16 hilos  62.50%
+    12556  msedge.exe               148.6 MiB  48 hilos  31.25%
+    17724  OpenCode.exe             107.3 MiB  43 hilos  31.25%
 > picowatch watch --interval 50 --ticks 2 explorer.exe
 Vigilando 1 proceso (cada 50 ms): explorer.exe
 [watch] + iniciado: explorer.exe (pid 2816)
@@ -232,7 +241,12 @@ Vigilando 1 proceso (cada 50 ms): explorer.exe
 C:\Users\Derte\AppData\Roaming\PicoWatch\config.txt
 ```
 
-El `0.00%` de CPU por proceso es la limitación documentada de Windows; en Linux el valor se calcula comparando dos lecturas de `/proc/[pid]/stat`.
+El desglose por núcleo y el porcentaje de proceso ya funcionan en Windows: se
+calculan con dos lecturas de contadores acumulativos (`NtQuerySystemInformation`
+y `GetProcessTimes`) y se expresan en puntos base relativos a un núcleo, igual
+que en Linux. La única limitación restante es la temperatura: Windows no expone
+una API ligera y se informa de «sin sensores disponibles» sin provocar un error
+de E/S.
 
 ---
 
@@ -278,15 +292,22 @@ Entorno: Rust 1.99.1, Zig 0.17.1, perfil `release`, 19/11/2026.
 | 6 | Windows x64 | 199.168 B (194,5 KiB) | +8.192 B | 0 |
 | 6 | Windows x86 | 189.440 B (185,0 KiB) | +8.192 B | 0 |
 | 6 | Windows ARM64 | 188.928 B (184,5 KiB) | +7.168 B | 0 |
-| 7 | **Linux x86_64** | **389.040 B (380,1 KiB)** | **+216 B** | 0 |
-| 7 | **Linux i686** | **422.848 B (412,9 KiB)** | **+224 B** | 0 |
-| 7 | **Linux AArch64** | **352.960 B (344,7 KiB)** | **+264 B** | 0 |
-| 7 | **Linux ARMv7** | **382.036 B (373,1 KiB)** | **+544 B** | 0 |
-| 7 | **Windows x64** | **199.168 B (194,5 KiB)** | **0 B** | 0 |
-| 7 | **Windows x86** | **189.440 B (185,0 KiB)** | **0 B** | 0 |
-| 7 | **Windows ARM64** | **188.928 B (184,5 KiB)** | **0 B** | 0 |
+| 7 | Linux x86_64 | 389.040 B (380,1 KiB) | +216 B | 0 |
+| 7 | Linux i686 | 422.848 B (412,9 KiB) | +224 B | 0 |
+| 7 | Linux AArch64 | 352.960 B (344,7 KiB) | +264 B | 0 |
+| 7 | Linux ARMv7 | 382.036 B (373,1 KiB) | +544 B | 0 |
+| 7 | Windows x64 | 199.168 B (194,5 KiB) | 0 B | 0 |
+| 7 | Windows x86 | 189.440 B (185,0 KiB) | 0 B | 0 |
+| 7 | Windows ARM64 | 188.928 B (184,5 KiB) | 0 B | 0 |
+| 8 | **Linux x86_64** | **389.232 B (380,1 KiB)** | **+192 B** | 0 |
+| 8 | **Linux i686** | **422.848 B (412,9 KiB)** | **0 B** | 0 |
+| 8 | **Linux AArch64** | **352.944 B (344,7 KiB)** | **−16 B** | 0 |
+| 8 | **Linux ARMv7** | **381.956 B (373,0 KiB)** | **−80 B** | 0 |
+| 8 | **Windows x64** | **199.680 B (195,0 KiB)** | **+512 B** | 0 |
+| 8 | **Windows x86** | **188.928 B (184,5 KiB)** | **−512 B** | 0 |
+| 8 | **Windows ARM64** | **189.440 B (185,0 KiB)** | **+512 B** | 0 |
 
-El descenso de Windows x64 en la Fase 3 respecto a la Fase 2 vino de un refactor del formateo de porcentajes, no de un cambio de perfil. La Fase 4 añadió el colector de procesos y el watchdog; la Fase 5, configuración, historial y alertas; la Fase 6, el escritor JSON. Todas las cifras siguen lejos del límite de 1-3 MB y el coste de JSON fue un 2-4 % del binario. **Ninguna optimización se declarará exitosa sin medición.**
+El descenso de Windows x64 en la Fase 3 respecto a la Fase 2 vino de un refactor del formateo de porcentajes, no de un cambio de perfil. La Fase 4 añadió el colector de procesos y el watchdog; la Fase 5, configuración, historial y alertas; la Fase 6, el escritor JSON; la Fase 8, el desglose de CPU por núcleo y por proceso en Windows. Siete objetivos siguen por debajo de 425 KB y el coste total de JSON fue un 2-4 % del binario. **Ninguna optimización se declarará exitosa sin medición.**
 
 ### Procedimiento de RAM, CPU y arranque
 
@@ -311,18 +332,24 @@ Resultados reales en este entorno, Windows x64, 30 iteraciones:
 
 | Comando | Pared (ms) | CPU (ms) | RAM pico (KiB) | Salida |
 | --- | ---: | ---: | ---: | ---: |
-| `version` (arranque) | 26,06 (mediana; mín. 24,69) | 0,00 | 2.168 | 16 B |
-| `help` | 31,44 | 0,00 | 2.624 | 1.039 B |
-| `cpu` | 130,69 | 15,63 | 3.504 | 11 B |
-| `memory` | 27,54 | 0,00 | 2.036 | 81 B |
-| `disk` | 27,85 | 15,63 | 2.772 | 79 B |
-| `temperature` | 28,06 | 15,63 | 2.864 | 0 B, exit 1 |
-| `network` | 31,89 | 0,00 | 2.736 | 3.568 B |
-| `processes` (267 proc.) | 41,91 | 15,63 | 3.744 | 16.677 B |
-| `status` | 132,35 | 0,00 | 3.252 | 284 B |
-| `status --json` | 132,79 | 0,00 | 3.268 | 4.525 B |
+| `version` (arranque) | 25,74 (mediana; mín. 24,69) | 0,00 | 2.168 | 16 B |
+| `help` | 28,88 | 0,00 | 3.488 | 1.039 B |
+| `cpu` (12 núcleos) | 128,12 | 15,63 | 3.528 | 195 B |
+| `memory` | 27,87 | 0,00 | 3.380 | 81 B |
+| `disk` | 27,70 | 0,00 | 3.248 | 79 B |
+| `temperature` | 28,77 | 0,00 | 2.036 | 38 B, exit 0 |
+| `network` | 32,94 | 15,63 | 2.996 | 3.568 B |
+| `processes` (268 proc.) | 152,05 | 31,25 | 3.840 | 16.810 B |
+| `status` | 131,12 | 0,00 | 3.268 | 462 B |
+| `status --json` | 131,38 | 0,00 | 3.268 | 4.586 B |
 
-El reloj de CPU de Windows tiene una granularidad de ~15,6 ms, de ahí los valores discretos. `cpu` y `status` incluyen la espera deliberada de 100 ms entre muestras; el sobrecoste real de JSON frente a `status` legible es de ~0,4 ms y 4 KB de salida. La RAM son ~2-4 MB de huella del proceso Windows (CRT y pila), no del heap de la aplicación.
+El reloj de CPU de Windows tiene una granularidad de ~15,6 ms, de ahí los valores discretos. `cpu`, `processes` y `status` incluyen la espera deliberada de 100 ms entre muestras; el sobrecoste real de JSON frente a `status` legible es de ~0,3 ms y 4 KB de salida. La RAM son ~2-4 MB de huella del proceso Windows (CRT y pila), no del heap de la aplicación. `processes` pasó de 42 ms a 152 ms en la Fase 8: el cálculo de CPU por proceso exige una segunda muestra, igual que en Linux, y se hace en el mismo hilo.
+
+Decisiones de la Fase 8, verificadas con medición:
+
+- El desglose por núcleo se lee con `NtQuerySystemInformation` en lugar de PDH: evita la coma flotante y las rutas de contador localizadas, y cuesta 0-512 B por binario.
+- `GetProcessTimes` y `K32GetProcessMemoryInfo` comparten un único `OpenProcess` por PID y muestra, en lugar de abrir dos handles: el tiempo de `processes` sube sólo por la segunda muestra (100 ms), no por llamadas extra.
+- `temperature` dejó de devolver `Unsupported`: la lista vacía mantiene el exit 0 y evita que `status` dependa de sensores inexistentes.
 
 Decisiones de la Fase 7, todas verificadas con medición:
 
@@ -346,8 +373,9 @@ Los binarios de Linux se generan por enlazado cruzado: el subsistema WSL de este
 | 5 | Configuración, historial y alertas | ✅ Completada |
 | 6 | Salida JSON y pruebas | ✅ Completada |
 | 7 | Optimización extrema y benchmarking | ✅ Completada |
+| 8 | Limitaciones de Windows: CPU por núcleo y por proceso | ✅ Completada |
 
-No se avanza de fase hasta que la anterior funcione y tenga pruebas. La salida JSON se produce con `--json` y convive con la legible: comparten colectores y `main` sólo elige el formateador.
+No se avanza de fase hasta que la anterior funcione y tenga pruebas. La salida JSON se produce con `--json` y convive con la legible: comparten colectores y `main` sólo elige el formateador. La única limitación de plataforma que queda es la temperatura en Windows, por carecer de API ligera; se informa como «sin sensores disponibles» sin provocar un error.
 
 ---
 

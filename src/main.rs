@@ -102,7 +102,8 @@ fn run() -> Result<(), Error> {
             let report = collectors::cpu::sample(collectors::cpu::DEFAULT_INTERVAL)?;
             let info = collectors::memory::read()?;
             let disk_info = collectors::disk::read()?;
-            // En Windows no hay API térmica ligera: el resumen sigue siendo útil.
+            // Windows no ofrece sensores y en Linux/sysfs pueden no existir:
+            // el resumen sigue siendo útil sin temperatura.
             let sensors = collectors::temperature::read().ok();
             let interfaces = collectors::network::read()?;
 

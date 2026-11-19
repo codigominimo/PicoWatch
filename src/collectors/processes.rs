@@ -1,15 +1,26 @@
 //! Listado de procesos con PID, nombre, hilos, RSS y uso de CPU.
 //!
 //! Linux: `/proc/[pid]/stat`, dos muestras separadas para calcular CPU.
-//! Windows: Toolhelp32 + `K32GetProcessMemoryInfo` para el working set.
+//! Windows: Toolhelp32, `K32GetProcessMemoryInfo` y `GetProcessTimes`.
 
 use std::io;
-#[cfg(target_os = "linux")]
 use std::thread;
 use std::time::Duration;
 
 /// Intervalo por defecto entre las dos muestras de CPU.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Convierte un incremento de contador en puntos base (10000 = un núcleo lleno).
+///
+/// `capacity` es el avance que tendría un núcleo ocupado al 100 % durante el
+/// intervalo, expresado en las mismas unidades que `busy`: ticks de reloj en
+/// Linux y unidades de 100 ns en Windows. Es pura y compartida por ambos.
+fn usage_basis_points(busy: u64, capacity: u64) -> u32 {
+    busy.saturating_mul(10_000)
+        .checked_div(capacity)
+        .unwrap_or(0)
+        .min(10_000) as u32
+}
 
 /// Proceso ya normalizado para salida.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,11 +143,7 @@ pub fn sample(interval: Duration) -> io::Result<Vec<Process>> {
             .find(|old| old.pid == current.pid)
             .map_or(current.ticks, |old| old.ticks);
         let busy = current.ticks.saturating_sub(previous_ticks);
-        let cpu = if period_ticks == 0 {
-            0
-        } else {
-            (busy.saturating_mul(10_000) / period_ticks).min(10_000) as u32
-        };
+        let cpu = usage_basis_points(busy, period_ticks);
         processes.push(Process {
             pid: current.pid,
             name: current.name,
@@ -214,14 +221,37 @@ pub fn list() -> io::Result<Vec<Process>> {
     crate::platform::windows::processes()
 }
 
+/// Toma dos muestras y calcula el uso de CPU de cada proceso.
+///
+/// `GetProcessTimes` devuelve el tiempo acumulado en unidades de 100 ns, así
+/// que un núcleo al 100 % avanza `interval_ms * 10_000` unidades. El
+/// porcentaje es relativo a un núcleo, igual que en `top` y que en Linux.
 #[cfg(target_os = "windows")]
-pub fn sample(_interval: Duration) -> io::Result<Vec<Process>> {
-    // Windows no expone los ticks por proceso sin abrir dos veces cada handle;
-    // se deja a cero y se documenta en el README.
-    let mut processes = crate::platform::windows::processes()?;
+pub fn sample(interval: Duration) -> io::Result<Vec<Process>> {
+    let first = crate::platform::windows::process_samples()?;
+    thread::sleep(interval);
+    let second = crate::platform::windows::process_samples()?;
+
+    // Un milisegundo tiene 10_000 unidades de 100 ns.
+    let capacity = interval.as_millis().max(1) as u64 * 10_000;
+    let mut processes = Vec::with_capacity(second.len());
+    for current in second {
+        let previous = first
+            .iter()
+            .find(|old| old.pid == current.pid)
+            .map_or(current.cpu_100ns, |old| old.cpu_100ns);
+        let busy = current.cpu_100ns.saturating_sub(previous);
+        processes.push(Process {
+            pid: current.pid,
+            name: current.name,
+            threads: current.threads,
+            rss_bytes: current.rss_bytes,
+            cpu_basis_points: usage_basis_points(busy, capacity),
+        });
+    }
     processes.sort_unstable_by(|a, b| {
-        b.rss_bytes
-            .cmp(&a.rss_bytes)
+        b.cpu_basis_points
+            .cmp(&a.cpu_basis_points)
             .then_with(|| a.pid.cmp(&b.pid))
     });
     Ok(processes)
@@ -229,7 +259,7 @@ pub fn sample(_interval: Duration) -> io::Result<Vec<Process>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_stat, ParseError};
+    use super::{parse_stat, usage_basis_points, ParseError};
 
     const STAT: &str = "1234 (mi proceso) R 1 1 1 0 -1 4194304 100 0 0 0 250 50 0 0 20 0 4 0 99 1000 50000 250 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
 
@@ -249,6 +279,16 @@ mod tests {
         let raw = parse_stat(&line).unwrap();
         assert_eq!(raw.name, "mi (proceso) raro");
         assert_eq!(raw.ticks, 300);
+    }
+
+    #[test]
+    fn calcula_cpu_relativa_a_un_nucleo() {
+        // 5000 unidades de 100 ns en 100 ms = medio núcleo (5000 puntos base).
+        assert_eq!(usage_basis_points(500_000, 1_000_000), 5000);
+        // Un núcleo completo nunca supera el 100 %.
+        assert_eq!(usage_basis_points(2_000_000, 1_000_000), 10_000);
+        assert_eq!(usage_basis_points(0, 1_000_000), 0);
+        assert_eq!(usage_basis_points(500_000, 0), 0);
     }
 
     #[test]

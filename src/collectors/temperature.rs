@@ -1,8 +1,9 @@
 //! Sensores térmicos desde `/sys/class/thermal`.
 //!
-//! Cada `thermal_zoneN/temp` contiene miligrados Celsius. En Windows no
-//! existe una API ligera equivalente (requiere WMI/COM), así que se informa
-//! de la limitación con un error `Unsupported` en lugar de lanzar procesos.
+//! Cada `thermal_zoneN/temp` contiene miligrados Celsius. Windows no expone
+//! una API ligera equivalente: la única fuente es WMI/COM, que añadiría cientos
+//! de líneas y dependencias de runtime. En Windows se devuelve una lista vacía
+//! para que `temperature` y `status` sigan funcionando sin error de E/S.
 
 use std::io;
 
@@ -72,12 +73,11 @@ pub fn read() -> io::Result<Vec<Sensor>> {
     Ok(sensors)
 }
 
+/// Windows no ofrece sensores térmicos sin recurrir a WMI/COM, así que se
+/// informa de "sin sensores" en lugar de fallar con `Unsupported`.
 #[cfg(target_os = "windows")]
 pub fn read() -> io::Result<Vec<Sensor>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "los sensores térmicos sólo están disponibles en Linux (sysfs)",
-    ))
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
