@@ -2,7 +2,7 @@
 
 Monitor de sistemas extremadamente ligero, escrito en Rust estable y sin dependencias externas. Funciona en **Windows y Linux**, en **x86 y ARM**.
 
-**Estado:** Fase 4 completada (procesos y watchdog, con backends por sistema operativo). 57 pruebas unitarias en verde.
+**Estado:** Fase 5 completada (configuración, historial y alertas). 76 pruebas unitarias en verde.
 
 ---
 
@@ -40,6 +40,8 @@ picowatch/
 │   └── measure.ps1        # tamaño y dependencias de los 7 objetivos
 ├── src/
 │   ├── main.rs            # punto de entrada, códigos de salida
+│   ├── alerts/
+│   │   └── mod.rs         # evaluate() puro de umbrales
 │   ├── cli/
 │   │   └── mod.rs         # Command, ParseError, parse() puro y testeable
 │   ├── collectors/
@@ -50,6 +52,8 @@ picowatch/
 │   │   ├── temperature.rs # /sys/class/thermal (sysfs)
 │   │   ├── network.rs     # /proc/net/dev | GetIfTable
 │   │   └── processes.rs   # /proc/[pid]/stat | Toolhelp32
+│   ├── config/
+│   │   └── mod.rs         # clave=valor, rutas por plataforma
 │   ├── core/
 │   │   └── mod.rs         # NAME, VERSION (constantes compile-time)
 │   ├── output/
@@ -58,6 +62,8 @@ picowatch/
 │   ├── platform/
 │   │   ├── mod.rs
 │   │   └── windows.rs     # FFI a kernel32, iphlpapi y Toolhelp32 (cfg windows)
+│   ├── storage/
+│   │   └── mod.rs         # historial TSV acotado
 │   └── watchdog/
 │       └── mod.rs         # diff() puro + bucle run() con E/S inyectada
 └── README.md
@@ -67,16 +73,18 @@ picowatch/
 
 ```text
 src/
-├── core/        config.rs, scheduler.rs, events.rs
-├── storage/     mod.rs
+├── core/        scheduler.rs, events.rs
 └── output/      json.rs
 ```
 
 Responsabilidades:
 
-- **`cli`** son funciones puras sobre iteradores de `OsStr`: no leen `std::env` y se prueban sin efectos laterales. `parse` devuelve comando + argumentos; `parse_watch` valida las opciones.
+- **`cli`** son funciones puras sobre iteradores de `OsStr`: no leen `std::env` y se prueban sin efectos laterales. `parse` devuelve comando + argumentos; `parse_watch`, `parse_config` y `parse_history` validan las opciones.
 - **`collectors`** separa el parseo puro (`parse_snapshot`, `parse_meminfo`, `parse_temperature`, `parse_netdev`, `parse_stat`) de la lectura del sistema. Las pruebas usan texto sintético y funcionan en cualquier host. Los porcentajes usan enteros en centésimas (`basis_points`), sin `f64`.
-- **`watchdog`** calcula eventos con `observed` + `diff` sobre mapas ordenados; `run` recibe la lectura y el reposo como closures, así que las pruebas no duermen ni necesitan procesos reales. No reinicia nada: las alertas llegan en la Fase 5.
+- **`config`** parsea `clave=valor` con `parse()` puro; `load()` usa los valores por defecto si no hay archivo. La ruta depende de `APPDATA` (Windows) o `XDG_CONFIG_HOME`/`HOME` (Linux), con retroceso al directorio actual.
+- **`storage`** guarda el historial en TSV, con `format_line`/`parse_line` puros y `append` acotado a `history_max` líneas. Una línea corrupta se ignora sin bloquear las muestras nuevas.
+- **`alerts`** es una función pura que compara métricas con umbrales; no imprime ni lee archivos.
+- **`watchdog`** calcula eventos con `observed` + `diff` sobre mapas ordenados; `run` recibe la lectura y el reposo como closures, así que las pruebas no duermen ni necesitan procesos reales.
 - **`platform`** concentra todo el código Windows específico. En Linux los colectores leen directamente con `std::fs`.
 - **`output::terminal`** recibe `&mut impl Write`, así que las pruebas usan `Vec<u8>` y `main` hace un único `lock()` de `stdout`.
 - **`main`** decide el código de salida: `0` éxito, `1` error de E/S, `2` error de sintaxis.
@@ -158,13 +166,18 @@ picowatch memory           RAM total, disponible y usada
 picowatch disk             Espacio del volumen raíz
 picowatch temperature      Sensores térmicos
 picowatch network          Tráfico por interfaz de red
-picowatch processes       Procesos: PID, nombre, hilos, RSS y CPU
+picowatch processes        Procesos: PID, nombre, hilos, RSS y CPU
 picowatch watch [--interval MS] [--ticks N] nombre [nombre...]
                            Vigila procesos y notifica inicios y paradas
-picowatch config          Comando reservado para la Fase 5
+picowatch config [show|path|init]
+                           Muestra la configuración, su ruta o la crea
+picowatch history [--last N]
+                           Últimas N muestras (por defecto 10)
 ```
 
-`network` y `watch` se añaden a la lista de ejemplos del enunciado para exponer de forma independiente los módulos de red y vigilancia. En `watch`, `--interval` vale 1000 ms por defecto y `--ticks 0` (por defecto) vigila hasta que se interrumpa el proceso.
+`network`, `watch` e `history` se añaden a la lista de ejemplos del enunciado para exponer de forma independiente los módulos de red, vigilancia e historial. En `watch`, `--interval` vale 1000 ms por defecto y `--ticks 0` (por defecto) vigila hasta que se interrumpa el proceso.
+
+`status` escribe una muestra en el historial y evalúa las alertas. El archivo de configuración se crea con `config init`; hasta entonces se usan los valores por defecto. En Windows queda en `%APPDATA%\PicoWatch\config.txt` y en Linux en `$XDG_CONFIG_HOME/picowatch/config` (o `~/.config/picowatch/config`). El historial se guarda como `history.log` junto a él, o en la ruta que indique `history_path`. `history_enabled=false` desactiva la escritura.
 
 Códigos de salida: `0` correcto, `1` error de E/S, `2` error de sintaxis. `cpu` y `processes` toman dos muestras separadas 100 ms; `watch` duerme entre muestras. Ningún comando crea hilos.
 
@@ -181,6 +194,12 @@ Memoria: 16384.0 MiB totales, 8192.0 MiB disponibles, 8192.0 MiB usadas (50.00%)
 Disco (/): 476.9 GiB totales, 293.4 GiB disponibles, 183.4 GiB usadas (38.46%)
 Temperatura: 1 sensor, máx. 45.2 °C
 Red: 3 interfaces
+Alertas: 1
+  Memoria: 95.00% (umbral 90.00%)
+$ picowatch history --last 2
+Historial (2 muestras):
+  1795128379 CPU 8.33% MEM 95.00% DISCO 38.51% RED 3 TEMP 45.2 °C
+  1795128380 CPU 4.16% MEM 94.80% DISCO 38.51% RED 3 TEMP 45.1 °C
 ```
 
 Ejemplo en Windows:
@@ -198,6 +217,8 @@ Procesos: 267
 > picowatch watch --interval 50 --ticks 2 explorer.exe
 Vigilando 1 proceso (cada 50 ms): explorer.exe
 [watch] + iniciado: explorer.exe (pid 2816)
+> picowatch config path
+C:\Users\Derte\AppData\Roaming\PicoWatch\config.txt
 ```
 
 El `0.00%` de CPU por proceso es la limitación documentada de Windows; en Linux el valor se calcula comparando dos lecturas de `/proc/[pid]/stat`.
@@ -225,15 +246,22 @@ Entorno: Rust 1.99.1, Zig 0.17.1, perfil `release`, 19/11/2026.
 | 3 | Windows x64 | 136.192 B (133,0 KiB) | −3.584 B | 0 |
 | 3 | Windows x86 | 127.488 B (124,5 KiB) | nuevo | 0 |
 | 3 | Windows ARM64 | 131.584 B (128,5 KiB) | nuevo | 0 |
-| 4 | **Linux x86_64** | **359.176 B (350,8 KiB)** | **+23.032 B** | 0 |
-| 4 | **Linux i686** | **383.032 B (374,1 KiB)** | **+24.120 B** | 0 |
-| 4 | **Linux AArch64** | **326.064 B (318,4 KiB)** | **+20.088 B** | 0 |
-| 4 | **Linux ARMv7** | **347.320 B (339,2 KiB)** | **+18.696 B** | 0 |
-| 4 | **Windows x64** | **153.600 B (150,0 KiB)** | **+17.408 B** | 0 |
-| 4 | **Windows x86** | **144.384 B (141,0 KiB)** | **+16.896 B** | 0 |
-| 4 | **Windows ARM64** | **147.968 B (144,5 KiB)** | **+16.384 B** | 0 |
+| 4 | Linux x86_64 | 359.176 B (350,8 KiB) | +23.032 B | 0 |
+| 4 | Linux i686 | 383.032 B (374,1 KiB) | +24.120 B | 0 |
+| 4 | Linux AArch64 | 326.064 B (318,4 KiB) | +20.088 B | 0 |
+| 4 | Linux ARMv7 | 347.320 B (339,2 KiB) | +18.696 B | 0 |
+| 4 | Windows x64 | 153.600 B (150,0 KiB) | +17.408 B | 0 |
+| 4 | Windows x86 | 144.384 B (141,0 KiB) | +16.896 B | 0 |
+| 4 | Windows ARM64 | 147.968 B (144,5 KiB) | +16.384 B | 0 |
+| 5 | **Linux x86_64** | **379.656 B (370,8 KiB)** | **+20.480 B** | 0 |
+| 5 | **Linux i686** | **410.176 B (400,6 KiB)** | **+27.144 B** | 0 |
+| 5 | **Linux AArch64** | **344.344 B (336,3 KiB)** | **+18.280 B** | 0 |
+| 5 | **Linux ARMv7** | **371.460 B (362,8 KiB)** | **+24.140 B** | 0 |
+| 5 | **Windows x64** | **190.976 B (186,5 KiB)** | **+37.376 B** | 0 |
+| 5 | **Windows x86** | **181.248 B (177,0 KiB)** | **+36.864 B** | 0 |
+| 5 | **Windows ARM64** | **181.760 B (177,5 KiB)** | **+33.792 B** | 0 |
 
-El descenso de Windows x64 en la Fase 3 respecto a la Fase 2 vino de un refactor del formateo de porcentajes, no de un cambio de perfil. El incremento de la Fase 4 es el coste del colector de procesos y del watchdog. Todas las cifras siguen lejos del límite de 1-3 MB. **Ninguna optimización se declarará exitosa sin medición.**
+El descenso de Windows x64 en la Fase 3 respecto a la Fase 2 vino de un refactor del formateo de porcentajes, no de un cambio de perfil. La Fase 4 añadió el colector de procesos y el watchdog; la Fase 5, configuración, historial y alertas. Todas las cifras siguen lejos del límite de 1-3 MB. **Ninguna optimización se declarará exitosa sin medición.**
 
 ### Procedimiento de RAM, CPU y arranque
 
@@ -264,7 +292,7 @@ Estas cifras se automatizarán en la Fase 7. En este entorno sólo se han ejecut
 | 2 | Monitorización de CPU y memoria | ✅ Completada |
 | 3 | Discos, temperatura y red | ✅ Completada |
 | 4 | Procesos y watchdog | ✅ Completada |
-| 5 | Historial y alertas | ⏳ Pendiente |
+| 5 | Configuración, historial y alertas | ✅ Completada |
 | 6 | Salida JSON y pruebas | ⏳ Pendiente |
 | 7 | Optimización extrema y benchmarking | ⏳ Pendiente |
 

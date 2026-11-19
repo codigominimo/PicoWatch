@@ -9,9 +9,6 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Comandos reconocidos por la CLI.
-///
-/// `config` se acepta para fijar la interfaz pública, pero se implementa en
-/// la Fase 5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Status,
@@ -23,6 +20,7 @@ pub enum Command {
     Processes,
     Watch,
     Config,
+    History,
     Version,
     Help,
 }
@@ -40,14 +38,15 @@ impl Command {
             Self::Processes => "processes",
             Self::Watch => "watch",
             Self::Config => "config",
+            Self::History => "history",
             Self::Version => "version",
             Self::Help => "help",
         }
     }
 
-    /// El único comando que admite argumentos propios.
+    /// Comandos que admiten argumentos propios.
     pub const fn takes_arguments(self) -> bool {
-        matches!(self, Self::Watch)
+        matches!(self, Self::Watch | Self::Config | Self::History)
     }
 }
 
@@ -82,6 +81,14 @@ pub struct WatchOptions {
     pub interval_ms: u64,
     /// Número de muestras; `0` significa hasta que se interrumpa el proceso.
     pub ticks: u32,
+}
+
+/// Acción solicitada por `config`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigAction {
+    Show,
+    Path,
+    Init,
 }
 
 /// Errores de sintaxis de la línea de comandos.
@@ -141,6 +148,7 @@ where
         arg if arg == "processes" => Command::Processes,
         arg if arg == "watch" => Command::Watch,
         arg if arg == "config" => Command::Config,
+        arg if arg == "history" => Command::History,
         arg if arg == "version" || arg == "--version" || arg == "-V" => Command::Version,
         arg if arg == "help" || arg == "--help" || arg == "-h" => Command::Help,
         other => return Err(ParseError::UnknownCommand(other.to_os_string())),
@@ -211,9 +219,62 @@ where
     })
 }
 
+/// Interpreta los argumentos de `config`.
+pub fn parse_config<I, S>(args: I) -> Result<ConfigAction, ParseError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut iter = args.into_iter();
+    let action = match iter.next() {
+        None => ConfigAction::Show,
+        Some(arg) => match arg.as_ref() {
+            value if value == "show" => ConfigAction::Show,
+            value if value == "path" => ConfigAction::Path,
+            value if value == "init" => ConfigAction::Init,
+            other => return Err(ParseError::UnexpectedArgument(other.to_os_string())),
+        },
+    };
+    if let Some(extra) = iter.next() {
+        return Err(ParseError::UnexpectedArgument(
+            extra.as_ref().to_os_string(),
+        ));
+    }
+    Ok(action)
+}
+
+/// Interpreta los argumentos de `history`: `--last N`.
+pub fn parse_history<I, S>(args: I) -> Result<usize, ParseError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut iter = args.into_iter();
+    let first = match iter.next() {
+        None => return Ok(10),
+        Some(arg) => arg,
+    };
+    if first.as_ref() != "--last" {
+        return Err(ParseError::UnexpectedArgument(
+            first.as_ref().to_os_string(),
+        ));
+    }
+    let value = iter.next().ok_or(ParseError::MissingValue("--last"))?;
+    let count: usize = parse_number(value.as_ref(), "--last")?;
+    if let Some(extra) = iter.next() {
+        return Err(ParseError::UnexpectedArgument(
+            extra.as_ref().to_os_string(),
+        ));
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse, parse_watch, Command, Invocation, ParseError, WatchOptions};
+    use super::{
+        parse, parse_config, parse_history, parse_watch, Command, ConfigAction, Invocation,
+        ParseError, WatchOptions,
+    };
 
     #[test]
     fn sin_argumentos_muestra_ayuda() {
@@ -235,6 +296,7 @@ mod tests {
             ("processes", Command::Processes),
             ("watch", Command::Watch),
             ("config", Command::Config),
+            ("history", Command::History),
             ("version", Command::Version),
             ("help", Command::Help),
         ];
@@ -265,6 +327,35 @@ mod tests {
                 command: Command::Watch,
                 arguments: vec!["init".into(), "--ticks".into(), "2".into()],
             })
+        );
+    }
+
+    #[test]
+    fn parsea_acciones_de_configuracion() {
+        assert_eq!(
+            parse_config(std::iter::empty::<&str>()),
+            Ok(ConfigAction::Show)
+        );
+        assert_eq!(parse_config(["show"]), Ok(ConfigAction::Show));
+        assert_eq!(parse_config(["path"]), Ok(ConfigAction::Path));
+        assert_eq!(parse_config(["init"]), Ok(ConfigAction::Init));
+        assert_eq!(
+            parse_config(["init", "extra"]),
+            Err(ParseError::UnexpectedArgument("extra".into()))
+        );
+    }
+
+    #[test]
+    fn parsea_opciones_de_historial() {
+        assert_eq!(parse_history(std::iter::empty::<&str>()), Ok(10));
+        assert_eq!(parse_history(["--last", "25"]), Ok(25));
+        assert_eq!(
+            parse_history(["--last"]),
+            Err(ParseError::MissingValue("--last"))
+        );
+        assert_eq!(
+            parse_history(["--last", "x"]),
+            Err(ParseError::InvalidValue("x".into(), "--last"))
         );
     }
 

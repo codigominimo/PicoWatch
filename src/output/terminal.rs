@@ -4,15 +4,18 @@
 //! con un `Vec<u8>` y para evitar bloquear la salida estándar más de una vez.
 
 use std::io::{self, Write};
+use std::path::Path;
 
-use crate::cli::Command;
+use crate::alerts::{Alert, Metric};
 use crate::collectors::cpu::{CpuReport, CpuUsage};
 use crate::collectors::disk::DiskInfo;
 use crate::collectors::memory::MemoryInfo;
 use crate::collectors::network::Interface;
 use crate::collectors::processes::Process;
 use crate::collectors::temperature::Sensor;
+use crate::config::Config;
 use crate::core::{NAME, VERSION};
+use crate::storage::Record;
 use crate::watchdog::{Event, Kind};
 
 const HELP: &str = "\
@@ -29,7 +32,8 @@ Comandos:
   network        Tráfico por interfaz de red
   processes      Procesos en ejecución
   watch          Vigilancia de procesos y servicios
-  config         Configuración
+  config         Muestra o crea la configuración
+  history        Últimas muestras del historial
   version        Versión del programa
   help           Muestra esta ayuda
 
@@ -37,10 +41,14 @@ Opciones:
   -h, --help     Muestra esta ayuda
   -V, --version  Muestra la versión
 
-Vigilancia:
+Opciones de comandos:
   watch [--interval MS] [--ticks N] nombre [nombre...]
     --interval MS  Periodo entre muestras (por defecto 1000 ms)
     --ticks N      Número de muestras; 0 = indefinido
+  history [--last N]
+    --last N       Número de muestras a mostrar (por defecto 10)
+  config [show|path|init]
+    init           Crea el archivo de configuración si no existe
 ";
 
 /// Escribe la ayuda completa.
@@ -51,23 +59,6 @@ pub fn help<W: Write>(out: &mut W) -> io::Result<()> {
 /// Escribe la versión en una sola línea.
 pub fn version<W: Write>(out: &mut W) -> io::Result<()> {
     writeln!(out, "{NAME} {VERSION}")
-}
-
-/// Informa de que un comando está reservado para una fase posterior.
-pub fn pending<W: Write>(out: &mut W, command: Command) -> io::Result<()> {
-    writeln!(
-        out,
-        "{command}: comando reservado, disponible en la Fase {}",
-        phase(command)
-    )
-}
-
-fn phase(command: Command) -> u8 {
-    if command == Command::Config {
-        5
-    } else {
-        1
-    }
 }
 
 /// Escribe el resumen de CPU y de cada núcleo.
@@ -182,6 +173,59 @@ pub fn watch_event<W: Write>(out: &mut W, event: &Event) -> io::Result<()> {
     )
 }
 
+/// Muestra la configuración efectiva y la ruta del archivo.
+pub fn config<W: Write>(out: &mut W, config: &Config, path: &Path) -> io::Result<()> {
+    writeln!(out, "Configuración: {}", path.display())?;
+    out.write_all(crate::config::to_text(config).as_bytes())
+}
+
+/// Muestra las últimas muestras del historial, de antigua a reciente.
+pub fn history<W: Write>(out: &mut W, records: &[Record]) -> io::Result<()> {
+    if records.is_empty() {
+        return writeln!(out, "Historial: sin muestras");
+    }
+    writeln!(out, "Historial ({} muestras):", records.len())?;
+    for record in records {
+        write!(out, "  {} CPU ", record.timestamp)?;
+        write_percentage(out, record.cpu_basis_points)?;
+        write!(out, " MEM ")?;
+        write_percentage(out, record.memory_basis_points)?;
+        write!(out, " DISCO ")?;
+        write_percentage(out, record.disk_basis_points)?;
+        write!(out, " RED {}", record.interfaces)?;
+        if let Some(value) = record.temperature_millicelsius {
+            write!(out, " TEMP ")?;
+            write_celsius(out, value)?;
+        }
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+/// Muestra las alertas activas y sus umbrales.
+pub fn alerts<W: Write>(out: &mut W, alerts: &[Alert], config: &Config) -> io::Result<()> {
+    if alerts.is_empty() {
+        return writeln!(out, "Alertas: ninguna");
+    }
+    writeln!(out, "Alertas: {}", alerts.len())?;
+    for alert in alerts {
+        write!(out, "  {}: ", alert.metric.label())?;
+        match alert.metric {
+            Metric::Temperature => write_celsius(out, alert.value as i64)?,
+            _ => write_percentage(out, alert.value as u32)?,
+        }
+        write!(out, " (umbral ")?;
+        match alert.metric {
+            Metric::Cpu => write_percentage(out, config.cpu_alert)?,
+            Metric::Memory => write_percentage(out, config.memory_alert)?,
+            Metric::Disk => write_percentage(out, config.disk_alert)?,
+            Metric::Temperature => write_celsius(out, config.temperature_alert)?,
+        }
+        writeln!(out, ")")?;
+    }
+    Ok(())
+}
+
 /// Resumen general: CPU, memoria, disco, temperatura y red.
 ///
 /// `sensors` es `None` cuando la plataforma no ofrece sensores (Windows).
@@ -255,16 +299,20 @@ fn write_celsius<W: Write>(out: &mut W, millicelsius: i64) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cpu, disk, help, memory, network, pending, processes, status, temperature, version,
-        watch_event, watch_start, Command,
+        alerts, config, cpu, disk, help, history, memory, network, processes, status, temperature,
+        version, watch_event, watch_start,
     };
+    use crate::alerts::{Alert, Metric};
     use crate::collectors::cpu::{CpuReport, CpuUsage};
     use crate::collectors::disk::DiskInfo;
     use crate::collectors::memory::MemoryInfo;
     use crate::collectors::network::Interface;
     use crate::collectors::processes::Process;
     use crate::collectors::temperature::Sensor;
+    use crate::config::Config;
+    use crate::storage::Record;
     use crate::watchdog::{Event, Kind};
+    use std::path::Path;
 
     #[test]
     fn ayuda_incluye_comandos_principales() {
@@ -294,16 +342,6 @@ mod tests {
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             format!("picowatch {}\n", env!("CARGO_PKG_VERSION"))
-        );
-    }
-
-    #[test]
-    fn pendiente_indica_fase() {
-        let mut buf = Vec::new();
-        pending(&mut buf, Command::Config).unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "config: comando reservado, disponible en la Fase 5\n"
         );
     }
 
@@ -464,6 +502,88 @@ mod tests {
              [watch] + iniciado: init (pid 1)\n\
              [watch] - detenido: sshd (pid 99)\n"
         );
+    }
+
+    #[test]
+    fn config_muestra_ruta_y_valores() {
+        let settings = Config {
+            cpu_alert: 8500,
+            ..Config::default()
+        };
+        let mut buf = Vec::new();
+        config(&mut buf, &settings, Path::new("/tmp/picowatch/config")).unwrap();
+        let texto = String::from_utf8(buf).unwrap();
+        assert!(texto.starts_with("Configuración: /tmp/picowatch/config\n"));
+        assert!(texto.contains("cpu_alert=8500\n"));
+    }
+
+    #[test]
+    fn historial_muestra_muestras_y_sensores() {
+        let records = [
+            Record {
+                timestamp: 100,
+                cpu_basis_points: 1234,
+                memory_basis_points: 5000,
+                disk_basis_points: 7500,
+                temperature_millicelsius: Some(45_200),
+                interfaces: 3,
+            },
+            Record {
+                timestamp: 101,
+                cpu_basis_points: 0,
+                memory_basis_points: 0,
+                disk_basis_points: 0,
+                temperature_millicelsius: None,
+                interfaces: 0,
+            },
+        ];
+        let mut buf = Vec::new();
+        history(&mut buf, &records).unwrap();
+        let texto = String::from_utf8(buf).unwrap();
+        assert!(texto.starts_with("Historial (2 muestras):\n"));
+        assert!(texto.contains("100 CPU 12.34% MEM 50.00% DISCO 75.00% RED 3 TEMP 45.2 °C"));
+        assert!(texto.contains("101 CPU 0.00%"));
+        assert!(!texto.contains("101 CPU 0.00% TEMP"));
+    }
+
+    #[test]
+    fn historial_vacio_lo_indica() {
+        let mut buf = Vec::new();
+        history(&mut buf, &[]).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "Historial: sin muestras\n");
+    }
+
+    #[test]
+    fn alertas_muestran_valor_y_umbral() {
+        let config = Config {
+            cpu_alert: 9000,
+            temperature_alert: 80_000,
+            ..Config::default()
+        };
+        let detected = [
+            Alert {
+                metric: Metric::Cpu,
+                value: 9500,
+            },
+            Alert {
+                metric: Metric::Temperature,
+                value: 85_000,
+            },
+        ];
+        let mut buf = Vec::new();
+        alerts(&mut buf, &detected, &config).unwrap();
+        let texto = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            texto,
+            "Alertas: 2\n  CPU: 95.00% (umbral 90.00%)\n  Temperatura: 85.0 °C (umbral 80.0 °C)\n"
+        );
+    }
+
+    #[test]
+    fn sin_alertas_lo_indica() {
+        let mut buf = Vec::new();
+        alerts(&mut buf, &[], &Config::default()).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "Alertas: ninguna\n");
     }
 
     #[test]

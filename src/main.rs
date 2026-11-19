@@ -1,12 +1,15 @@
 //! Punto de entrada de PicoWatch.
 //!
-//! Fase 4: CLI, colectores multiplataforma, processes y watchdog.
+//! Fase 5: configuración, historial y alertas sobre los colectores existentes.
 
+mod alerts;
 mod cli;
 mod collectors;
+mod config;
 mod core;
 mod output;
 mod platform;
+mod storage;
 mod watchdog;
 
 use std::fmt;
@@ -69,6 +72,35 @@ fn run() -> Result<(), Error> {
             // En Windows no hay API térmica ligera: el resumen sigue siendo útil.
             let sensors = collectors::temperature::read().ok();
             let interfaces = collectors::network::read()?;
+
+            let settings = config::load()?;
+            let max_temperature = sensors
+                .as_ref()
+                .and_then(|list| list.iter().map(|sensor| sensor.millicelsius).max());
+            let detected = alerts::evaluate(
+                &settings,
+                report.usage.basis_points,
+                info.used_basis_points(),
+                disk_info.used_basis_points(),
+                max_temperature,
+            );
+
+            if settings.history_enabled {
+                let record = storage::Record {
+                    timestamp: storage::now(),
+                    cpu_basis_points: report.usage.basis_points,
+                    memory_basis_points: info.used_basis_points(),
+                    disk_basis_points: disk_info.used_basis_points(),
+                    temperature_millicelsius: max_temperature,
+                    interfaces: interfaces.len() as u32,
+                };
+                storage::append(
+                    &config::history_file(&settings),
+                    record,
+                    settings.history_max,
+                )?;
+            }
+
             output::terminal::status(
                 &mut out,
                 &report,
@@ -77,6 +109,7 @@ fn run() -> Result<(), Error> {
                 sensors.as_deref(),
                 &interfaces,
             )?;
+            output::terminal::alerts(&mut out, &detected, &settings)?;
         }
         Command::Processes => {
             let processes = collectors::processes::sample(collectors::processes::DEFAULT_INTERVAL)?;
@@ -85,11 +118,29 @@ fn run() -> Result<(), Error> {
         Command::Watch => {
             let options = cli::parse_watch(invocation.arguments)?;
             let interval_ms = options.interval_ms;
-            let config = watchdog::from_options(options);
-            output::terminal::watch_start(&mut out, &config.names, interval_ms)?;
-            watchdog::run_system(&config, &mut out)?;
+            let settings = watchdog::from_options(options);
+            output::terminal::watch_start(&mut out, &settings.names, interval_ms)?;
+            watchdog::run_system(&settings, &mut out)?;
         }
-        other => output::terminal::pending(&mut out, other)?,
+        Command::Config => match cli::parse_config(invocation.arguments)? {
+            cli::ConfigAction::Show => {
+                let settings = config::load()?;
+                output::terminal::config(&mut out, &settings, &config::config_path())?;
+            }
+            cli::ConfigAction::Path => {
+                writeln!(out, "{}", config::config_path().display())?;
+            }
+            cli::ConfigAction::Init => {
+                let path = config::init()?;
+                writeln!(out, "Configuración creada: {}", path.display())?;
+            }
+        },
+        Command::History => {
+            let count = cli::parse_history(invocation.arguments)?;
+            let settings = config::load()?;
+            let records = storage::read_last(&config::history_file(&settings), count)?;
+            output::terminal::history(&mut out, &records)?;
+        }
     }
     Ok(())
 }
