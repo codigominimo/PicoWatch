@@ -7,8 +7,8 @@
   zig cc (libc estática) mediante un envoltorio temporal. El script no
   modifica la configuración del repositorio.
 
-  RAM, CPU y tiempos se miden en el equipo de destino con los comandos
-  documentados en README.md; se automatizarán en la Fase 7.
+  RAM, CPU y tiempos se automatizan en Windows con .\bench\bench.ps1; en
+  Linux se miden con /usr/bin/time según README.md.
 
 .EXAMPLE
   .\bench\measure.ps1 -Target armv7-unknown-linux-gnueabihf

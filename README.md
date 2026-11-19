@@ -2,7 +2,7 @@
 
 Monitor de sistemas extremadamente ligero, escrito en Rust estable y sin dependencias externas. Funciona en **Windows y Linux**, en **x86 y ARM**.
 
-**Estado:** Fase 6 completada (salida legible y JSON, sin dependencias). 88 pruebas unitarias en verde.
+**Estado:** Fase 7 completada (optimización medida y benchmarking automatizado). 88 pruebas unitarias en verde.
 
 ---
 
@@ -37,7 +37,8 @@ En Windows el porcentaje de CPU por núcleo no se ofrece: `GetSystemTimes` sólo
 picowatch/
 ├── Cargo.toml
 ├── bench/
-│   └── measure.ps1        # tamaño y dependencias de los 7 objetivos
+│   ├── measure.ps1        # tamaño y dependencias de los 7 objetivos
+│   └── bench.ps1          # arranque, RAM, CPU y tiempos por comando (Windows)
 ├── src/
 │   ├── main.rs            # punto de entrada, códigos de salida
 │   ├── alerts/
@@ -182,7 +183,7 @@ picowatch [--json] comando  Emite JSON en lugar de texto legible
 
 `status` escribe una muestra en el historial y evalúa las alertas. El archivo de configuración se crea con `config init`; hasta entonces se usan los valores por defecto. En Windows queda en `%APPDATA%\PicoWatch\config.txt` y en Linux en `$XDG_CONFIG_HOME/picowatch/config` (o `~/.config/picowatch/config`). El historial se guarda como `history.log` junto a él, o en la ruta que indique `history_path`. `history_enabled=false` desactiva la escritura.
 
-Códigos de salida: `0` correcto, `1` error de E/S, `2` error de sintaxis. `cpu` y `processes` toman dos muestras separadas 100 ms; `watch` duerme entre muestras. Ningún comando crea hilos.
+Códigos de salida: `0` correcto, `1` error de E/S, `2` error de sintaxis. `cpu` toma dos muestras separadas 100 ms; `processes` también en Linux (en Windows una sola, pues no hay CPU por proceso); `watch` duerme entre muestras. Ningún comando crea hilos.
 
 Ejemplo en Linux:
 
@@ -270,13 +271,20 @@ Entorno: Rust 1.99.1, Zig 0.17.1, perfil `release`, 19/11/2026.
 | 5 | Windows x64 | 190.976 B (186,5 KiB) | +37.376 B | 0 |
 | 5 | Windows x86 | 181.248 B (177,0 KiB) | +36.864 B | 0 |
 | 5 | Windows ARM64 | 181.760 B (177,5 KiB) | +33.792 B | 0 |
-| 6 | **Linux x86_64** | **388.824 B (379,7 KiB)** | **+9.168 B** | 0 |
-| 6 | **Linux i686** | **422.624 B (412,7 KiB)** | **+12.448 B** | 0 |
-| 6 | **Linux AArch64** | **352.696 B (344,4 KiB)** | **+8.352 B** | 0 |
-| 6 | **Linux ARMv7** | **381.492 B (372,6 KiB)** | **+10.032 B** | 0 |
-| 6 | **Windows x64** | **199.168 B (194,5 KiB)** | **+8.192 B** | 0 |
-| 6 | **Windows x86** | **189.440 B (185,0 KiB)** | **+8.192 B** | 0 |
-| 6 | **Windows ARM64** | **188.928 B (184,5 KiB)** | **+7.168 B** | 0 |
+| 6 | Linux x86_64 | 388.824 B (379,7 KiB) | +9.168 B | 0 |
+| 6 | Linux i686 | 422.624 B (412,7 KiB) | +12.448 B | 0 |
+| 6 | Linux AArch64 | 352.696 B (344,4 KiB) | +8.352 B | 0 |
+| 6 | Linux ARMv7 | 381.492 B (372,6 KiB) | +10.032 B | 0 |
+| 6 | Windows x64 | 199.168 B (194,5 KiB) | +8.192 B | 0 |
+| 6 | Windows x86 | 189.440 B (185,0 KiB) | +8.192 B | 0 |
+| 6 | Windows ARM64 | 188.928 B (184,5 KiB) | +7.168 B | 0 |
+| 7 | **Linux x86_64** | **389.040 B (380,1 KiB)** | **+216 B** | 0 |
+| 7 | **Linux i686** | **422.848 B (412,9 KiB)** | **+224 B** | 0 |
+| 7 | **Linux AArch64** | **352.960 B (344,7 KiB)** | **+264 B** | 0 |
+| 7 | **Linux ARMv7** | **382.036 B (373,1 KiB)** | **+544 B** | 0 |
+| 7 | **Windows x64** | **199.168 B (194,5 KiB)** | **0 B** | 0 |
+| 7 | **Windows x86** | **189.440 B (185,0 KiB)** | **0 B** | 0 |
+| 7 | **Windows ARM64** | **188.928 B (184,5 KiB)** | **0 B** | 0 |
 
 El descenso de Windows x64 en la Fase 3 respecto a la Fase 2 vino de un refactor del formateo de porcentajes, no de un cambio de perfil. La Fase 4 añadió el colector de procesos y el watchdog; la Fase 5, configuración, historial y alertas; la Fase 6, el escritor JSON. Todas las cifras siguen lejos del límite de 1-3 MB y el coste de JSON fue un 2-4 % del binario. **Ninguna optimización se declarará exitosa sin medición.**
 
@@ -294,10 +302,36 @@ time (for i in $(seq 1 100); do ./picowatch status > /dev/null; done)
 Windows (PowerShell):
 
 ```powershell
-Measure-Command { .\picowatch.exe status } | Select-Object TotalMilliseconds
+.\bench\bench.ps1 -Iterations 30
 ```
 
-Estas cifras se automatizarán en la Fase 7. En este entorno sólo se han ejecutado los binarios de Windows; los de Linux se generaron por enlazado cruzado y el subsistema WSL disponible no tenía su imagen montada, así que su ejecución queda pendiente de un equipo Linux.
+`bench.ps1` lanza cada comando con `ProcessStartInfo` y salida redirigida. Mide el tiempo de pared y de CPU sin sondear el proceso, y hace una pasada separada para el pico de `WorkingSet64` (Windows lo pone a 0 después de `WaitForExit`). No necesita módulos externos.
+
+Resultados reales en este entorno, Windows x64, 30 iteraciones:
+
+| Comando | Pared (ms) | CPU (ms) | RAM pico (KiB) | Salida |
+| --- | ---: | ---: | ---: | ---: |
+| `version` (arranque) | 26,06 (mediana; mín. 24,69) | 0,00 | 2.168 | 16 B |
+| `help` | 31,44 | 0,00 | 2.624 | 1.039 B |
+| `cpu` | 130,69 | 15,63 | 3.504 | 11 B |
+| `memory` | 27,54 | 0,00 | 2.036 | 81 B |
+| `disk` | 27,85 | 15,63 | 2.772 | 79 B |
+| `temperature` | 28,06 | 15,63 | 2.864 | 0 B, exit 1 |
+| `network` | 31,89 | 0,00 | 2.736 | 3.568 B |
+| `processes` (267 proc.) | 41,91 | 15,63 | 3.744 | 16.677 B |
+| `status` | 132,35 | 0,00 | 3.252 | 284 B |
+| `status --json` | 132,79 | 0,00 | 3.268 | 4.525 B |
+
+El reloj de CPU de Windows tiene una granularidad de ~15,6 ms, de ahí los valores discretos. `cpu` y `status` incluyen la espera deliberada de 100 ms entre muestras; el sobrecoste real de JSON frente a `status` legible es de ~0,4 ms y 4 KB de salida. La RAM son ~2-4 MB de huella del proceso Windows (CRT y pila), no del heap de la aplicación.
+
+Decisiones de la Fase 7, todas verificadas con medición:
+
+- `opt-level = "z"` produce 199.168 B frente a 211.968 B de `"s"` en Windows x64: se mantiene `z`.
+- En Linux x86_64, el enlazado estático es **menor** que el dinámico (388.824 B frente a 397.992 B) y no depende de glibc en el equipo destino: se mantiene `-C target-feature=+crt-static`.
+- Envolver `stdout` en `BufWriter` añadió 2.048 B y no mejoró el tiempo de `processes` de forma medible (18,32 vs 18,43 ms de mediana): se descartó.
+- En Linux, el nombre del proceso se toma del `comm` dentro de `/proc/[pid]/stat` en lugar de abrir `/proc/[pid]/comm` por PID y por muestra: elimina cientos de aperturas de archivo por consulta con un coste de 216-544 B.
+
+Los binarios de Linux se generan por enlazado cruzado: el subsistema WSL de este entorno no tenía su imagen montada, así que sus tiempos de ejecución quedan pendientes de un equipo Linux. Los comandos de medición están documentados arriba.
 
 ---
 
@@ -311,7 +345,7 @@ Estas cifras se automatizarán en la Fase 7. En este entorno sólo se han ejecut
 | 4 | Procesos y watchdog | ✅ Completada |
 | 5 | Configuración, historial y alertas | ✅ Completada |
 | 6 | Salida JSON y pruebas | ✅ Completada |
-| 7 | Optimización extrema y benchmarking | ⏳ Pendiente |
+| 7 | Optimización extrema y benchmarking | ✅ Completada |
 
 No se avanza de fase hasta que la anterior funcione y tenga pruebas. La salida JSON se produce con `--json` y convive con la legible: comparten colectores y `main` sólo elige el formateador.
 

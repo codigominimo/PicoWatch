@@ -22,10 +22,14 @@ pub struct Process {
 }
 
 /// Datos crudos de una única lectura de `/proc/[pid]/stat`.
+///
+/// `name` se extrae del propio `stat` (el `comm` entre paréntesis) para no
+/// abrir `/proc/[pid]/comm` por cada proceso en cada muestra.
 #[cfg(any(target_os = "linux", test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawProcess {
     pub pid: u32,
+    pub name: String,
     pub ticks: u64,
     pub rss_pages: u64,
     pub threads: u32,
@@ -64,6 +68,7 @@ pub fn parse_stat(text: &str) -> Result<RawProcess, ParseError> {
         .trim()
         .parse::<u32>()
         .map_err(|_| ParseError::InvalidField)?;
+    let name = text[open + 1..close].to_owned();
 
     let mut fields = text[close + 1..].split_whitespace();
     fields.next().ok_or(ParseError::TooShort)?; // state
@@ -75,6 +80,7 @@ pub fn parse_stat(text: &str) -> Result<RawProcess, ParseError> {
 
     Ok(RawProcess {
         pid,
+        name,
         ticks: utime.saturating_add(stime),
         rss_pages,
         threads: threads as u32,
@@ -98,7 +104,7 @@ pub fn list() -> io::Result<Vec<Process>> {
         .into_iter()
         .map(|raw| Process {
             pid: raw.pid,
-            name: name_of(raw.pid),
+            name: raw.name,
             threads: raw.threads,
             rss_bytes: raw.rss_pages.saturating_mul(page),
             cpu_basis_points: 0,
@@ -133,7 +139,7 @@ pub fn sample(interval: Duration) -> io::Result<Vec<Process>> {
         };
         processes.push(Process {
             pid: current.pid,
-            name: name_of(current.pid),
+            name: current.name,
             threads: current.threads,
             rss_bytes: current.rss_pages.saturating_mul(page),
             cpu_basis_points: cpu,
@@ -174,14 +180,6 @@ fn raw_list() -> io::Result<Vec<RawProcess>> {
         }
     }
     Ok(result)
-}
-
-#[cfg(target_os = "linux")]
-fn name_of(pid: u32) -> String {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .unwrap_or_default()
-        .trim()
-        .to_owned()
 }
 
 #[cfg(target_os = "linux")]
@@ -239,6 +237,7 @@ mod tests {
     fn parsea_stat_con_espacios_en_el_nombre() {
         let raw = parse_stat(STAT).unwrap();
         assert_eq!(raw.pid, 1234);
+        assert_eq!(raw.name, "mi proceso");
         assert_eq!(raw.ticks, 300);
         assert_eq!(raw.threads, 4);
         assert_eq!(raw.rss_pages, 50_000);
@@ -248,7 +247,7 @@ mod tests {
     fn acepta_parentesis_en_el_nombre() {
         let line = STAT.replace("(mi proceso)", "(mi (proceso) raro)");
         let raw = parse_stat(&line).unwrap();
-        assert_eq!(raw.pid, 1234);
+        assert_eq!(raw.name, "mi (proceso) raro");
         assert_eq!(raw.ticks, 300);
     }
 
