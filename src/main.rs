@@ -1,12 +1,13 @@
 //! Punto de entrada de PicoWatch.
 //!
-//! Fase 2: CLI, compilación optimizada y colectores de CPU y memoria.
+//! Fase 4: CLI, colectores multiplataforma, processes y watchdog.
 
 mod cli;
 mod collectors;
 mod core;
 mod output;
 mod platform;
+mod watchdog;
 
 use std::fmt;
 use std::io::{self, Write};
@@ -34,11 +35,11 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Error> {
-    let command = cli::parse(std::env::args_os().skip(1))?;
+    let invocation = cli::parse(std::env::args_os().skip(1))?;
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    match command {
+    match invocation.command {
         Command::Help => output::terminal::help(&mut out)?,
         Command::Version => output::terminal::version(&mut out)?,
         Command::Cpu => {
@@ -76,6 +77,17 @@ fn run() -> Result<(), Error> {
                 sensors.as_deref(),
                 &interfaces,
             )?;
+        }
+        Command::Processes => {
+            let processes = collectors::processes::sample(collectors::processes::DEFAULT_INTERVAL)?;
+            output::terminal::processes(&mut out, &processes)?;
+        }
+        Command::Watch => {
+            let options = cli::parse_watch(invocation.arguments)?;
+            let interval_ms = options.interval_ms;
+            let config = watchdog::from_options(options);
+            output::terminal::watch_start(&mut out, &config.names, interval_ms)?;
+            watchdog::run_system(&config, &mut out)?;
         }
         other => output::terminal::pending(&mut out, other)?,
     }

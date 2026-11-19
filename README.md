@@ -2,7 +2,7 @@
 
 Monitor de sistemas extremadamente ligero, escrito en Rust estable y sin dependencias externas. Funciona en **Windows y Linux**, en **x86 y ARM**.
 
-**Estado:** Fase 3 completada (disco, temperatura y red, con backends por sistema operativo). 41 pruebas unitarias en verde.
+**Estado:** Fase 4 completada (procesos y watchdog, con backends por sistema operativo). 57 pruebas unitarias en verde.
 
 ---
 
@@ -12,7 +12,7 @@ Monitor de sistemas extremadamente ligero, escrito en Rust estable y sin depende
 | --- | --- |
 | Tamaño mínimo | `opt-level = "z"`, LTO, una unidad de código y `strip`. |
 | RAM mínima | Sin frameworks ni runtimes; un solo bloqueo de `stdout` por ejecución. |
-| CPU en reposo | La aplicación es síncrona y de un solo disparo: no hay bucles ni hilos persistentes. |
+| CPU en reposo | Todo es síncrono; `watch` duerme entre muestras y no crea hilos. |
 | Cero dependencias | Sólo `std`, más declaraciones FFI directas. Ver §3. |
 | Seguridad | Se conserva PIE/RELRO; no se usa `-no-pie` para ahorrar unos bytes. |
 | Simplicidad | Sin `unwrap` en producción, sin estado global. El `unsafe` se limita a FFI justificada. |
@@ -24,10 +24,10 @@ Monitor de sistemas extremadamente ligero, escrito en Rust estable y sin depende
 
 | Sistema | Arquitecturas | Backend | Limitación |
 | --- | --- | --- | --- |
-| Linux | x86_64, i686, aarch64, armv7 | `/proc`, `/sys`, `statvfs` | Ninguna de las métricas de esta fase. |
-| Windows | x86_64, i686, aarch64 | `kernel32`, `iphlpapi` | No hay API térmica ligera: `temperature` devuelve `Unsupported` y `status` muestra «no disponible en esta plataforma». |
+| Linux | x86_64, i686, aarch64, armv7 | `/proc`, `/sys`, `statvfs`, `sysconf` | Ninguna de las métricas implementadas. |
+| Windows | x86_64, i686, aarch64 | `kernel32`, `iphlpapi`, Toolhelp32 | No hay API térmica ligera: `temperature` devuelve `Unsupported` y `status` muestra «no disponible en esta plataforma». El uso de CPU por proceso se muestra a `0.00%`. |
 
-En Windows el porcentaje de CPU por núcleo no se ofrece: `GetSystemTimes` sólo da el agregado y la alternativa (PDH) añadiría una dependencia pesada. El enunciado admite el desglose «cuando sea posible».
+En Windows el porcentaje de CPU por núcleo no se ofrece: `GetSystemTimes` sólo da el agregado y la alternativa (PDH) añadiría una dependencia pesada. Tampoco se calcula CPU por proceso: exigiría abrir dos veces el handle de cada PID con `QueryProcessCycleTime`. En Linux ambos desgloses sí están disponibles y el porcentaje de proceso es relativo a un núcleo, como en `top`.
 
 ---
 
@@ -48,15 +48,18 @@ picowatch/
 │   │   ├── memory.rs      # /proc/meminfo | GlobalMemoryStatusEx
 │   │   ├── disk.rs        # statvfs | GetDiskFreeSpaceExW
 │   │   ├── temperature.rs # /sys/class/thermal (sysfs)
-│   │   └── network.rs     # /proc/net/dev | GetIfTable
+│   │   ├── network.rs     # /proc/net/dev | GetIfTable
+│   │   └── processes.rs   # /proc/[pid]/stat | Toolhelp32
 │   ├── core/
 │   │   └── mod.rs         # NAME, VERSION (constantes compile-time)
 │   ├── output/
 │   │   ├── mod.rs
 │   │   └── terminal.rs    # funciones Write genérico para todos los comandos
-│   └── platform/
-│       ├── mod.rs
-│       └── windows.rs     # FFI a kernel32 e iphlpapi (cfg windows)
+│   ├── platform/
+│   │   ├── mod.rs
+│   │   └── windows.rs     # FFI a kernel32, iphlpapi y Toolhelp32 (cfg windows)
+│   └── watchdog/
+│       └── mod.rs         # diff() puro + bucle run() con E/S inyectada
 └── README.md
 ```
 
@@ -65,16 +68,15 @@ picowatch/
 ```text
 src/
 ├── core/        config.rs, scheduler.rs, events.rs
-├── collectors/  processes.rs
-├── watchdog/    mod.rs
 ├── storage/     mod.rs
 └── output/      json.rs
 ```
 
 Responsabilidades:
 
-- **`cli`** es una función pura sobre un iterador de `OsStr`: no lee `std::env`, no asigna en la ruta correcta y se prueba sin efectos laterales.
-- **`collectors`** separa el parseo puro (`parse_snapshot`, `parse_meminfo`, `parse_temperature`, `parse_netdev`) de la lectura del sistema. Las pruebas usan texto sintético y funcionan en cualquier host. Los porcentajes usan enteros en centésimas (`basis_points`), sin `f64`.
+- **`cli`** son funciones puras sobre iteradores de `OsStr`: no leen `std::env` y se prueban sin efectos laterales. `parse` devuelve comando + argumentos; `parse_watch` valida las opciones.
+- **`collectors`** separa el parseo puro (`parse_snapshot`, `parse_meminfo`, `parse_temperature`, `parse_netdev`, `parse_stat`) de la lectura del sistema. Las pruebas usan texto sintético y funcionan en cualquier host. Los porcentajes usan enteros en centésimas (`basis_points`), sin `f64`.
+- **`watchdog`** calcula eventos con `observed` + `diff` sobre mapas ordenados; `run` recibe la lectura y el reposo como closures, así que las pruebas no duermen ni necesitan procesos reales. No reinicia nada: las alertas llegan en la Fase 5.
 - **`platform`** concentra todo el código Windows específico. En Linux los colectores leen directamente con `std::fs`.
 - **`output::terminal`** recibe `&mut impl Write`, así que las pruebas usan `Vec<u8>` y `main` hace un único `lock()` de `stdout`.
 - **`main`** decide el código de salida: `0` éxito, `1` error de E/S, `2` error de sintaxis.
@@ -90,10 +92,10 @@ Responsabilidades:
 | `clap` | Parseo de CLI | Cientos de KiB y asignaciones para comandos fijos. |
 | `serde` / `serde_json` | Salida JSON | Se implementará un escritor mínimo en la Fase 6. |
 | `sysinfo` | Métricas del sistema | Arrastre de dependencias y allocations; `/proc`, `/sys` y la API nativa se usan directamente. |
-| `libc` | Llamadas al sistema | Añadiría un crate y una capa que no evita declarar las estructuras (`statvfs`) ni las funciones de Windows. Se declaran las cinco funciones necesarias. |
+| `libc` | Llamadas al sistema | Añadiría un crate y una capa que no evita declarar las estructuras (`statvfs`, `PROCESSENTRY32W`) ni las funciones de Windows. Se declaran las doce funciones necesarias. |
 | `anyhow` / `thiserror` | Errores | Un enum de dos variantes y `From` bastan. |
 
-Las funciones declaradas mediante FFI son `GetSystemTimes`, `GlobalMemoryStatusEx`, `GetDiskFreeSpaceExW` y `GetIfTable` (Windows) y `statvfs` (Linux). `std` no expone estas métricas y la alternativa de lanzar `wmic`/`df`/PowerShell sería lenta, dependiente de la configuración regional y frágil. Cada bloque `unsafe` está acompañado de un comentario `SAFETY`; no hay `unsafe` en el parseo ni en la lógica de presentación.
+Las funciones declaradas mediante FFI son `GetSystemTimes`, `GlobalMemoryStatusEx`, `GetDiskFreeSpaceExW`, `GetIfTable`, `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW`, `OpenProcess`, `K32GetProcessMemoryInfo` y `CloseHandle` (Windows), y `statvfs` y `sysconf` (Linux). `std` no expone estas métricas y la alternativa de lanzar `wmic`/`tasklist`/`df`/PowerShell sería lenta, dependiente de la configuración regional y frágil. Cada bloque `unsafe` está acompañado de un comentario `SAFETY`; no hay `unsafe` en el parseo ni en la lógica de presentación. Los handles se cierran siempre, incluso cuando la consulta de memoria falla.
 
 Criterio para incorporar cualquier dependencia futura: describir el problema, demostrar que implementarlo directamente no es fiable, medir el incremento de binario y de RAM, y documentarlo aquí antes del `Cargo.toml`.
 
@@ -156,13 +158,15 @@ picowatch memory           RAM total, disponible y usada
 picowatch disk             Espacio del volumen raíz
 picowatch temperature      Sensores térmicos
 picowatch network          Tráfico por interfaz de red
-picowatch processes|watch|config
-                           Comandos reservados para fases posteriores
+picowatch processes       Procesos: PID, nombre, hilos, RSS y CPU
+picowatch watch [--interval MS] [--ticks N] nombre [nombre...]
+                           Vigila procesos y notifica inicios y paradas
+picowatch config          Comando reservado para la Fase 5
 ```
 
-`network` se añade a la lista de ejemplos del enunciado para exponer de forma independiente el módulo de red exigido en la sección de monitorización.
+`network` y `watch` se añaden a la lista de ejemplos del enunciado para exponer de forma independiente los módulos de red y vigilancia. En `watch`, `--interval` vale 1000 ms por defecto y `--ticks 0` (por defecto) vigila hasta que se interrumpa el proceso.
 
-Códigos de salida: `0` correcto, `1` error de E/S, `2` error de sintaxis. `cpu` toma dos muestras separadas 100 ms; esa es la única ventana de actividad y termina con el proceso.
+Códigos de salida: `0` correcto, `1` error de E/S, `2` error de sintaxis. `cpu` y `processes` toman dos muestras separadas 100 ms; `watch` duerme entre muestras. Ningún comando crea hilos.
 
 Ejemplo en Linux:
 
@@ -188,7 +192,15 @@ picowatch: error de E/S: los sensores térmicos sólo están disponibles en Linu
 ...
 Temperatura: no disponible en esta plataforma
 Red: 45 interfaces
+> picowatch processes
+Procesos: 267
+    23744  opencode-cli.exe         420.4 MiB  27 hilos  0.00%
+> picowatch watch --interval 50 --ticks 2 explorer.exe
+Vigilando 1 proceso (cada 50 ms): explorer.exe
+[watch] + iniciado: explorer.exe (pid 2816)
 ```
+
+El `0.00%` de CPU por proceso es la limitación documentada de Windows; en Linux el valor se calcula comparando dos lecturas de `/proc/[pid]/stat`.
 
 ---
 
@@ -206,15 +218,22 @@ Entorno: Rust 1.99.1, Zig 0.17.1, perfil `release`, 19/11/2026.
 | 2 | Linux x86_64 | 313.928 B (306,6 KiB) | +12.072 B | 0 |
 | 2 | Linux AArch64 | 285.120 B (278,4 KiB) | +11.216 B | 0 |
 | 2 | Windows x64 | 139.776 B | +22.016 B | 0 |
-| 3 | **Linux x86_64** | **336.144 B (328,3 KiB)** | **+22.216 B** | 0 |
-| 3 | **Linux i686** | **358.912 B (350,5 KiB)** | nuevo | 0 |
-| 3 | **Linux AArch64** | **305.976 B (298,8 KiB)** | **+20.856 B** | 0 |
-| 3 | **Linux ARMv7** | **328.624 B (320,9 KiB)** | nuevo | 0 |
-| 3 | **Windows x64** | **136.192 B (133,0 KiB)** | −3.584 B | 0 |
-| 3 | **Windows x86** | **127.488 B (124,5 KiB)** | nuevo | 0 |
-| 3 | **Windows ARM64** | **131.584 B (128,5 KiB)** | nuevo | 0 |
+| 3 | Linux x86_64 | 336.144 B (328,3 KiB) | +22.216 B | 0 |
+| 3 | Linux i686 | 358.912 B (350,5 KiB) | nuevo | 0 |
+| 3 | Linux AArch64 | 305.976 B (298,8 KiB) | +20.856 B | 0 |
+| 3 | Linux ARMv7 | 328.624 B (320,9 KiB) | nuevo | 0 |
+| 3 | Windows x64 | 136.192 B (133,0 KiB) | −3.584 B | 0 |
+| 3 | Windows x86 | 127.488 B (124,5 KiB) | nuevo | 0 |
+| 3 | Windows ARM64 | 131.584 B (128,5 KiB) | nuevo | 0 |
+| 4 | **Linux x86_64** | **359.176 B (350,8 KiB)** | **+23.032 B** | 0 |
+| 4 | **Linux i686** | **383.032 B (374,1 KiB)** | **+24.120 B** | 0 |
+| 4 | **Linux AArch64** | **326.064 B (318,4 KiB)** | **+20.088 B** | 0 |
+| 4 | **Linux ARMv7** | **347.320 B (339,2 KiB)** | **+18.696 B** | 0 |
+| 4 | **Windows x64** | **153.600 B (150,0 KiB)** | **+17.408 B** | 0 |
+| 4 | **Windows x86** | **144.384 B (141,0 KiB)** | **+16.896 B** | 0 |
+| 4 | **Windows ARM64** | **147.968 B (144,5 KiB)** | **+16.384 B** | 0 |
 
-El descenso de Windows x64 respecto a la Fase 2 viene de un refactor del formateo de porcentajes, no de un cambio de perfil de compilación. Todas las cifras siguen lejos del límite de 1-3 MB. **Ninguna optimización se declarará exitosa sin medición.**
+El descenso de Windows x64 en la Fase 3 respecto a la Fase 2 vino de un refactor del formateo de porcentajes, no de un cambio de perfil. El incremento de la Fase 4 es el coste del colector de procesos y del watchdog. Todas las cifras siguen lejos del límite de 1-3 MB. **Ninguna optimización se declarará exitosa sin medición.**
 
 ### Procedimiento de RAM, CPU y arranque
 
@@ -244,7 +263,7 @@ Estas cifras se automatizarán en la Fase 7. En este entorno sólo se han ejecut
 | 1 | Estructura mínima, CLI y compilación optimizada | ✅ Completada |
 | 2 | Monitorización de CPU y memoria | ✅ Completada |
 | 3 | Discos, temperatura y red | ✅ Completada |
-| 4 | Procesos y watchdog | ⏳ Pendiente |
+| 4 | Procesos y watchdog | ✅ Completada |
 | 5 | Historial y alertas | ⏳ Pendiente |
 | 6 | Salida JSON y pruebas | ⏳ Pendiente |
 | 7 | Optimización extrema y benchmarking | ⏳ Pendiente |

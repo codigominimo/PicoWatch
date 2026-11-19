@@ -10,8 +10,10 @@ use crate::collectors::cpu::{CpuReport, CpuUsage};
 use crate::collectors::disk::DiskInfo;
 use crate::collectors::memory::MemoryInfo;
 use crate::collectors::network::Interface;
+use crate::collectors::processes::Process;
 use crate::collectors::temperature::Sensor;
 use crate::core::{NAME, VERSION};
+use crate::watchdog::{Event, Kind};
 
 const HELP: &str = "\
 PicoWatch - monitor de sistemas extremadamente ligero
@@ -34,6 +36,11 @@ Comandos:
 Opciones:
   -h, --help     Muestra esta ayuda
   -V, --version  Muestra la versión
+
+Vigilancia:
+  watch [--interval MS] [--ticks N] nombre [nombre...]
+    --interval MS  Periodo entre muestras (por defecto 1000 ms)
+    --ticks N      Número de muestras; 0 = indefinido
 ";
 
 /// Escribe la ayuda completa.
@@ -56,10 +63,10 @@ pub fn pending<W: Write>(out: &mut W, command: Command) -> io::Result<()> {
 }
 
 fn phase(command: Command) -> u8 {
-    match command {
-        Command::Processes | Command::Watch => 4,
-        Command::Config => 5,
-        _ => 1,
+    if command == Command::Config {
+        5
+    } else {
+        1
     }
 }
 
@@ -130,6 +137,49 @@ pub fn network<W: Write>(out: &mut W, interfaces: &[Interface]) -> io::Result<()
         writeln!(out)?;
     }
     Ok(())
+}
+
+/// Escribe el listado de procesos ordenado por uso de CPU.
+pub fn processes<W: Write>(out: &mut W, processes: &[Process]) -> io::Result<()> {
+    writeln!(out, "Procesos: {}", processes.len())?;
+    for process in processes {
+        write!(out, "  {:>7}  {:<24} ", process.pid, process.name)?;
+        write_mib(out, process.rss_bytes)?;
+        write!(out, "  {} hilos  ", process.threads)?;
+        write_percentage(out, process.cpu_basis_points)?;
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+/// Anuncia el inicio de una sesión de vigilancia.
+pub fn watch_start<W: Write>(out: &mut W, names: &[String], interval_ms: u64) -> io::Result<()> {
+    let noun = if names.len() == 1 {
+        "proceso"
+    } else {
+        "procesos"
+    };
+    writeln!(
+        out,
+        "Vigilando {} {} (cada {} ms): {}",
+        names.len(),
+        noun,
+        interval_ms,
+        names.join(", ")
+    )
+}
+
+/// Escribe un evento de aparición o desaparición.
+pub fn watch_event<W: Write>(out: &mut W, event: &Event) -> io::Result<()> {
+    let (verb, sign) = match event.kind {
+        Kind::Started => ("iniciado", '+'),
+        Kind::Stopped => ("detenido", '-'),
+    };
+    writeln!(
+        out,
+        "[watch] {sign} {verb}: {} (pid {})",
+        event.name, event.pid
+    )
 }
 
 /// Resumen general: CPU, memoria, disco, temperatura y red.
@@ -204,12 +254,17 @@ fn write_celsius<W: Write>(out: &mut W, millicelsius: i64) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cpu, disk, help, memory, network, pending, status, temperature, version, Command};
+    use super::{
+        cpu, disk, help, memory, network, pending, processes, status, temperature, version,
+        watch_event, watch_start, Command,
+    };
     use crate::collectors::cpu::{CpuReport, CpuUsage};
     use crate::collectors::disk::DiskInfo;
     use crate::collectors::memory::MemoryInfo;
     use crate::collectors::network::Interface;
+    use crate::collectors::processes::Process;
     use crate::collectors::temperature::Sensor;
+    use crate::watchdog::{Event, Kind};
 
     #[test]
     fn ayuda_incluye_comandos_principales() {
@@ -245,18 +300,21 @@ mod tests {
     #[test]
     fn pendiente_indica_fase() {
         let mut buf = Vec::new();
-        pending(&mut buf, Command::Processes).unwrap();
+        pending(&mut buf, Command::Config).unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "processes: comando reservado, disponible en la Fase 4\n"
+            "config: comando reservado, disponible en la Fase 5\n"
         );
     }
 
     #[test]
     fn salida_no_escribe_en_otro_buffer() {
-        let mut buf = Vec::new();
-        pending(&mut buf, Command::Config).unwrap();
-        assert!(String::from_utf8(buf).unwrap().contains("Fase 5"));
+        let mut version_buf = Vec::new();
+        let mut help_buf = Vec::new();
+        version(&mut version_buf).unwrap();
+        help(&mut help_buf).unwrap();
+        assert!(version_buf.len() < help_buf.len());
+        assert!(!help_buf.starts_with(b"picowatch"));
     }
 
     #[test]
@@ -347,6 +405,64 @@ mod tests {
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             "Red:\n  eth0: RX 2.0 MiB, TX 1.0 MiB\n"
+        );
+    }
+
+    #[test]
+    fn procesos_muestra_pid_memoria_hilos_y_cpu() {
+        let list = [Process {
+            pid: 1234,
+            name: "init".into(),
+            threads: 4,
+            rss_bytes: 1024 * 1024,
+            cpu_basis_points: 1234,
+        }];
+        let mut buf = Vec::new();
+        processes(&mut buf, &list).unwrap();
+        let texto = String::from_utf8(buf).unwrap();
+        assert!(texto.starts_with("Procesos: 1\n"));
+        assert!(texto.contains("1234"));
+        assert!(texto.contains("init"));
+        assert!(texto.contains("1.0 MiB"));
+        assert!(texto.contains("4 hilos"));
+        assert!(texto.contains("12.34%\n"));
+    }
+
+    #[test]
+    fn processes_vacio_no_imprime_filas() {
+        let mut buf = Vec::new();
+        processes(&mut buf, &[]).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "Procesos: 0\n");
+    }
+
+    #[test]
+    fn vigilancia_muestra_inicio_y_eventos() {
+        let names = vec!["init".to_string(), "sshd".to_string()];
+        let mut buf = Vec::new();
+        watch_start(&mut buf, &names, 250).unwrap();
+        watch_event(
+            &mut buf,
+            &Event {
+                kind: Kind::Started,
+                name: "init".into(),
+                pid: 1,
+            },
+        )
+        .unwrap();
+        watch_event(
+            &mut buf,
+            &Event {
+                kind: Kind::Stopped,
+                name: "sshd".into(),
+                pid: 99,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "Vigilando 2 procesos (cada 250 ms): init, sshd\n\
+             [watch] + iniciado: init (pid 1)\n\
+             [watch] - detenido: sshd (pid 99)\n"
         );
     }
 

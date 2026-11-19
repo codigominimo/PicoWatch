@@ -5,6 +5,7 @@
 //! con estructuras `#[repr(C)]` y sin punteros devueltos por la API, de modo
 //! que el riesgo se limita a las llamadas FFI siguientes.
 
+use std::ffi::c_void;
 use std::io;
 use std::mem::{size_of, zeroed};
 
@@ -51,6 +52,28 @@ extern "system" {
         total: *mut u64,
         total_free: *mut u64,
     ) -> i32;
+
+    #[link_name = "CreateToolhelp32Snapshot"]
+    fn create_toolhelp32_snapshot(flags: u32, process_id: u32) -> *mut c_void;
+
+    #[link_name = "Process32FirstW"]
+    fn process32_first_w(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+
+    #[link_name = "Process32NextW"]
+    fn process32_next_w(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+
+    #[link_name = "OpenProcess"]
+    fn open_process(access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+
+    #[link_name = "K32GetProcessMemoryInfo"]
+    fn get_process_memory_info(
+        process: *mut c_void,
+        counters: *mut ProcessMemoryCounters,
+        size: u32,
+    ) -> i32;
+
+    #[link_name = "CloseHandle"]
+    fn close_handle(handle: *mut c_void) -> i32;
 }
 
 /// Devuelve `(usuario, kernel, idle)` en ticks de 100 ns.
@@ -194,9 +217,117 @@ pub fn interfaces() -> io::Result<Vec<crate::collectors::network::Interface>> {
     Ok(result)
 }
 
+/// `PROCESSENTRY32W`, según `tlhelp32.h`. `th32DefaultHeapID` es `ULONG_PTR`,
+/// por eso se usa `usize`: elonga 4 bytes en x86 y 8 en x64/ARM64.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcessEntry32W {
+    size: u32,
+    _usage_count: u32,
+    pid: u32,
+    _default_heap_id: usize,
+    _module_id: u32,
+    threads: u32,
+    _parent_pid: u32,
+    _base_priority: i32,
+    _flags: u32,
+    exe_file: [u16; 260], // MAX_PATH
+}
+
+/// `PROCESS_MEMORY_COUNTERS`, según `psapi.h`.
+#[repr(C)]
+struct ProcessMemoryCounters {
+    size: u32,
+    _page_fault_count: u32,
+    _peak_working_set_size: usize,
+    working_set_size: usize,
+    _quota_peak_paged_pool_usage: usize,
+    _quota_paged_pool_usage: usize,
+    _quota_peak_non_paged_pool_usage: usize,
+    _quota_non_paged_pool_usage: usize,
+    _pagefile_usage: usize,
+    _peak_pagefile_usage: usize,
+}
+
+/// Devuelve el `HANDLE` inválido de forma explícita: `-1` como puntero.
+fn is_invalid_handle(handle: *mut c_void) -> bool {
+    handle.is_null() || handle as isize == -1
+}
+
+fn utf16_until_nul(chars: &[u16]) -> String {
+    let len = chars
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(chars.len());
+    String::from_utf16_lossy(&chars[..len])
+}
+
+/// Working set (RSS) de un PID, o cero si no se puede consultar.
+fn working_set(pid: u32) -> u64 {
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    // SAFETY: `OpenProcess` no recibe punteros de usuario; un handle inválido
+    // se detecta antes de usarlo.
+    let handle = unsafe { open_process(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if is_invalid_handle(handle) {
+        return 0;
+    }
+
+    // SAFETY: estructura POD alineada; `cb` se fija antes de la llamada.
+    let mut counters: ProcessMemoryCounters = unsafe { zeroed() };
+    counters.size = size_of::<ProcessMemoryCounters>() as u32;
+
+    // SAFETY: el handle es válido y la estructura tiene el tamaño declarado.
+    let ok = unsafe { get_process_memory_info(handle, &mut counters, counters.size) };
+
+    // SAFETY: el handle fue abierto por `OpenProcess` y no se guarda.
+    unsafe { close_handle(handle) };
+
+    if ok == 0 {
+        0
+    } else {
+        counters.working_set_size as u64
+    }
+}
+
+/// Lista de procesos del sistema mediante Toolhelp32.
+pub fn processes() -> io::Result<Vec<crate::collectors::processes::Process>> {
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+
+    // SAFETY: flags y PID son escalares; el handle se valida a continuación.
+    let snapshot = unsafe { create_toolhelp32_snapshot(TH32CS_SNAPPROCESS, 0) };
+    if is_invalid_handle(snapshot) {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: estructura POD alineada; `dwSize` debe fijarse antes de la
+    // primera llamada, tal como exige `Process32FirstW`.
+    let mut entry: ProcessEntry32W = unsafe { zeroed() };
+    entry.size = size_of::<ProcessEntry32W>() as u32;
+
+    let mut result = Vec::new();
+    // SAFETY: `entry` y `snapshot` son válidos durante la llamada.
+    let mut more = unsafe { process32_first_w(snapshot, &mut entry) } != 0;
+    while more {
+        result.push(crate::collectors::processes::Process {
+            pid: entry.pid,
+            name: utf16_until_nul(&entry.exe_file),
+            threads: entry.threads,
+            rss_bytes: working_set(entry.pid),
+            cpu_basis_points: 0,
+        });
+        // SAFETY: misma precondition que `Process32FirstW`.
+        more = unsafe { process32_next_w(snapshot, &mut entry) } != 0;
+    }
+
+    // SAFETY: handle abierto por `CreateToolhelp32Snapshot` y no guardado.
+    unsafe { close_handle(snapshot) };
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cpu_times, disk_bytes, interfaces, memory_bytes};
+    use super::{cpu_times, disk_bytes, interfaces, memory_bytes, processes};
 
     #[test]
     fn win32_devuelve_contadores_de_cpu() {
@@ -225,5 +356,13 @@ mod tests {
         for interface in list {
             assert!(!interface.name.is_empty());
         }
+    }
+
+    #[test]
+    fn win32_devuelve_procesos() {
+        let list = processes().unwrap();
+        assert!(!list.is_empty());
+        assert!(list.iter().any(|process| !process.name.is_empty()));
+        assert!(list.iter().any(|process| process.rss_bytes > 0));
     }
 }

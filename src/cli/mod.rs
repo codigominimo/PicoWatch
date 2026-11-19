@@ -1,16 +1,17 @@
 //! Analizador de línea de comandos sin dependencias externas.
 //!
-//! `parse` es una función pura sobre un iterador, por lo que se puede probar
-//! sin leer `std::env`. En la ruta correcta no realiza ninguna asignación:
-//! compara `&OsStr` directamente y sólo copia datos en la ruta de error.
+//! `parse` y `parse_watch` son funciones puras sobre iteradores, por lo que se
+//! pueden probar sin leer `std::env`. En la ruta correcta comparan `&OsStr`
+//! directamente y sólo asignan cuando hay argumentos que conservar.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::str::FromStr;
 
 /// Comandos reconocidos por la CLI.
 ///
-/// `processes`, `watch` y `config` se aceptan para fijar la interfaz pública,
-/// pero se implementan en fases posteriores.
+/// `config` se acepta para fijar la interfaz pública, pero se implementa en
+/// la Fase 5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Status,
@@ -43,6 +44,11 @@ impl Command {
             Self::Help => "help",
         }
     }
+
+    /// El único comando que admite argumentos propios.
+    pub const fn takes_arguments(self) -> bool {
+        matches!(self, Self::Watch)
+    }
 }
 
 impl fmt::Display for Command {
@@ -51,11 +57,41 @@ impl fmt::Display for Command {
     }
 }
 
+/// Comando más sus argumentos sin analizar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invocation {
+    pub command: Command,
+    pub arguments: Vec<OsString>,
+}
+
+impl From<Command> for Invocation {
+    fn from(command: Command) -> Self {
+        Self {
+            command,
+            arguments: Vec::new(),
+        }
+    }
+}
+
+/// Opciones ya validadas del comando `watch`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchOptions {
+    /// Nombres de proceso a vigilar (coincidencia exacta).
+    pub names: Vec<String>,
+    /// Periodo entre muestras, en milisegundos.
+    pub interval_ms: u64,
+    /// Número de muestras; `0` significa hasta que se interrumpa el proceso.
+    pub ticks: u32,
+}
+
 /// Errores de sintaxis de la línea de comandos.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
     UnknownCommand(OsString),
     UnexpectedArgument(OsString),
+    MissingValue(&'static str),
+    InvalidValue(OsString, &'static str),
+    MissingProcessName,
 }
 
 impl fmt::Display for ParseError {
@@ -67,14 +103,24 @@ impl fmt::Display for ParseError {
             Self::UnexpectedArgument(arg) => {
                 write!(f, "argumento inesperado: {}", arg.to_string_lossy())
             }
+            Self::MissingValue(option) => write!(f, "falta el valor para {option}"),
+            Self::InvalidValue(value, option) => {
+                write!(
+                    f,
+                    "valor no válido para {option}: {}",
+                    value.to_string_lossy()
+                )
+            }
+            Self::MissingProcessName => f.write_str("watch necesita al menos un nombre de proceso"),
         }
     }
 }
 
 /// Parsea los argumentos **sin** incluir el nombre del programa.
 ///
-/// Sin argumentos se muestra la ayuda, comportamiento habitual en CLI.
-pub fn parse<I, S>(args: I) -> Result<Command, ParseError>
+/// Sin argumentos se muestra la ayuda, comportamiento habitual en CLI. Sólo
+/// `watch` conserva argumentos; el resto los rechaza como antes.
+pub fn parse<I, S>(args: I) -> Result<Invocation, ParseError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -82,7 +128,7 @@ where
     let mut iter = args.into_iter();
     let first = match iter.next() {
         Some(arg) => arg,
-        None => return Ok(Command::Help),
+        None => return Ok(Command::Help.into()),
     };
 
     let command = match first.as_ref() {
@@ -100,22 +146,81 @@ where
         other => return Err(ParseError::UnknownCommand(other.to_os_string())),
     };
 
-    if let Some(extra) = iter.next() {
-        return Err(ParseError::UnexpectedArgument(
-            extra.as_ref().to_os_string(),
-        ));
+    let rest: Vec<OsString> = iter.map(|arg| arg.as_ref().to_os_string()).collect();
+    if !command.takes_arguments() {
+        if let Some(extra) = rest.first() {
+            return Err(ParseError::UnexpectedArgument(extra.clone()));
+        }
     }
 
-    Ok(command)
+    Ok(Invocation {
+        command,
+        arguments: rest,
+    })
+}
+
+fn parse_number<T: FromStr>(arg: &OsStr, option: &'static str) -> Result<T, ParseError> {
+    arg.to_str()
+        .and_then(|text| text.parse::<T>().ok())
+        .ok_or_else(|| ParseError::InvalidValue(arg.to_os_string(), option))
+}
+
+/// Interpreta los argumentos de `watch`.
+///
+/// Sintaxis: `watch [--interval MS] [--ticks N] nombre [nombre...]`.
+/// El orden de las opciones y los nombres es libre.
+pub fn parse_watch<I, S>(args: I) -> Result<WatchOptions, ParseError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut names = Vec::new();
+    let mut interval_ms = 1000u64;
+    let mut ticks = 0u32;
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        let raw = arg.as_ref();
+        let text = raw.to_string_lossy();
+        match text.as_ref() {
+            "--interval" => {
+                let value = iter.next().ok_or(ParseError::MissingValue("--interval"))?;
+                interval_ms = parse_number(value.as_ref(), "--interval")?;
+                if interval_ms == 0 {
+                    return Err(ParseError::InvalidValue(
+                        value.as_ref().to_os_string(),
+                        "--interval",
+                    ));
+                }
+            }
+            "--ticks" => {
+                let value = iter.next().ok_or(ParseError::MissingValue("--ticks"))?;
+                ticks = parse_number(value.as_ref(), "--ticks")?;
+            }
+            _ => names.push(text.into_owned()),
+        }
+    }
+
+    if names.is_empty() {
+        return Err(ParseError::MissingProcessName);
+    }
+    Ok(WatchOptions {
+        names,
+        interval_ms,
+        ticks,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, Command, ParseError};
+    use super::{parse, parse_watch, Command, Invocation, ParseError, WatchOptions};
 
     #[test]
     fn sin_argumentos_muestra_ayuda() {
-        assert_eq!(parse(std::iter::empty::<&str>()), Ok(Command::Help));
+        assert_eq!(
+            parse(std::iter::empty::<&str>()),
+            Ok(Invocation::from(Command::Help))
+        );
     }
 
     #[test]
@@ -134,18 +239,33 @@ mod tests {
             ("help", Command::Help),
         ];
         for (entrada, esperado) in casos {
-            assert_eq!(parse([entrada]), Ok(esperado), "comando {entrada}");
+            assert_eq!(
+                parse([entrada]),
+                Ok(Invocation::from(esperado)),
+                "comando {entrada}"
+            );
         }
     }
 
     #[test]
     fn alias_de_ayuda_y_version() {
         for alias in ["--help", "-h"] {
-            assert_eq!(parse([alias]), Ok(Command::Help));
+            assert_eq!(parse([alias]), Ok(Invocation::from(Command::Help)));
         }
         for alias in ["--version", "-V"] {
-            assert_eq!(parse([alias]), Ok(Command::Version));
+            assert_eq!(parse([alias]), Ok(Invocation::from(Command::Version)));
         }
+    }
+
+    #[test]
+    fn watch_conserva_sus_argumentos() {
+        assert_eq!(
+            parse(["watch", "init", "--ticks", "2"]),
+            Ok(Invocation {
+                command: Command::Watch,
+                arguments: vec!["init".into(), "--ticks".into(), "2".into()],
+            })
+        );
     }
 
     #[test]
@@ -169,6 +289,54 @@ mod tests {
     }
 
     #[test]
+    fn parsea_opciones_de_watch() {
+        assert_eq!(
+            parse_watch(["--interval", "250", "--ticks", "3", "init", "sshd"]),
+            Ok(WatchOptions {
+                names: vec!["init".into(), "sshd".into()],
+                interval_ms: 250,
+                ticks: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn watch_usa_valores_por_defecto() {
+        assert_eq!(
+            parse_watch(["init"]),
+            Ok(WatchOptions {
+                names: vec!["init".into()],
+                interval_ms: 1000,
+                ticks: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn rechaza_opciones_de_watch_invalidas() {
+        assert_eq!(
+            parse_watch(["--interval"]),
+            Err(ParseError::MissingValue("--interval"))
+        );
+        assert_eq!(
+            parse_watch(["--ticks"]),
+            Err(ParseError::MissingValue("--ticks"))
+        );
+        assert_eq!(
+            parse_watch(["--interval", "x", "init"]),
+            Err(ParseError::InvalidValue("x".into(), "--interval"))
+        );
+        assert_eq!(
+            parse_watch(["--interval", "0", "init"]),
+            Err(ParseError::InvalidValue("0".into(), "--interval"))
+        );
+        assert_eq!(
+            parse_watch(std::iter::empty::<&str>()),
+            Err(ParseError::MissingProcessName)
+        );
+    }
+
+    #[test]
     fn display_usa_la_forma_canonica() {
         assert_eq!(Command::Temperature.to_string(), "temperature");
     }
@@ -182,6 +350,18 @@ mod tests {
         assert_eq!(
             ParseError::UnexpectedArgument("y".into()).to_string(),
             "argumento inesperado: y"
+        );
+        assert_eq!(
+            ParseError::MissingValue("--ticks").to_string(),
+            "falta el valor para --ticks"
+        );
+        assert_eq!(
+            ParseError::InvalidValue("z".into(), "--ticks").to_string(),
+            "valor no válido para --ticks: z"
+        );
+        assert_eq!(
+            ParseError::MissingProcessName.to_string(),
+            "watch necesita al menos un nombre de proceso"
         );
     }
 }
