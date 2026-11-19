@@ -167,6 +167,30 @@ fn push(history: &mut VecDeque<u64>, value: u64) {
     history.push_back(value);
 }
 
+/// Procesa una tecla. Devuelve `false` cuando el usuario pide salir.
+fn handle_key(app: &mut App, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => false,
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            app.change_interval(true);
+            true
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            app.change_interval(false);
+            true
+        }
+        KeyCode::Char('r') => {
+            app.force_refresh = true;
+            true
+        }
+        KeyCode::Char(' ') => {
+            app.paused = !app.paused;
+            true
+        }
+        _ => true,
+    }
+}
+
 /// Arranca el TUI y no devuelve control hasta que el usuario sale con `q`.
 pub fn run() -> io::Result<()> {
     enable_raw_mode()?;
@@ -185,16 +209,8 @@ pub fn run() -> io::Result<()> {
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('+') | KeyCode::Char('=') => app.change_interval(true),
-                    KeyCode::Char('-') | KeyCode::Char('_') => app.change_interval(false),
-                    KeyCode::Char('r') => app.force_refresh = true,
-                    KeyCode::Char(' ') => app.paused = !app.paused,
-                    _ => {}
+                if key.kind == KeyEventKind::Press && !handle_key(&mut app, key.code) {
+                    break;
                 }
             }
         }
@@ -519,7 +535,7 @@ fn truncate(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{alert_text, mib, percent, push, render, truncate, App, HISTORY_LEN};
+    use super::{alert_text, handle_key, mib, percent, push, render, truncate, App, HISTORY_LEN};
     use crate::alerts::{Alert, Metric};
     use crate::collectors::cpu::{CpuReport, CpuUsage};
     use crate::collectors::disk::DiskInfo;
@@ -527,6 +543,7 @@ mod tests {
     use crate::collectors::network::Interface;
     use crate::collectors::processes::Process;
     use crate::collectors::temperature::Sensor;
+    use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -575,6 +592,26 @@ mod tests {
         assert_eq!(app.cpu_history.len(), HISTORY_LEN);
         assert_eq!(app.cpu_history.front(), Some(&10));
         assert_eq!(app.cpu_history.back(), Some(&(HISTORY_LEN as u64 + 9)));
+    }
+
+    #[test]
+    fn las_teclas_controlan_el_panel() {
+        let mut app = App::new();
+        assert!(handle_key(&mut app, KeyCode::Char(' ')));
+        assert!(app.paused);
+        assert!(handle_key(&mut app, KeyCode::Char(' ')));
+        assert!(!app.paused);
+
+        assert!(handle_key(&mut app, KeyCode::Char('+')));
+        assert_eq!(app.interval.as_millis(), 1500);
+        assert!(handle_key(&mut app, KeyCode::Char('-')));
+        assert_eq!(app.interval.as_millis(), 1000);
+
+        assert!(handle_key(&mut app, KeyCode::Char('r')));
+        assert!(app.force_refresh);
+        assert!(handle_key(&mut app, KeyCode::Char('x')));
+        assert!(!handle_key(&mut app, KeyCode::Char('q')));
+        assert!(!handle_key(&mut app, KeyCode::Esc));
     }
 
     #[test]

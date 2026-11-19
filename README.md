@@ -2,7 +2,7 @@
 
 Monitor de sistemas extremadamente ligero, escrito en Rust estable. Funciona en **Windows y Linux**, en **x86 y ARM**. Al ejecutarlo sin argumentos abre un **panel interactivo con gráficas**; los comandos de texto y JSON siguen disponibles para guiones.
 
-**Estado:** Fase 9 completada (interfaz TUI con ratatui). 100 pruebas unitarias en verde. Los colectores y la CLI siguen sin dependencias; el panel añade dos crates (§3).
+**Estado:** Fase 9 completada (interfaz TUI con ratatui). 101 pruebas unitarias en verde. Los colectores y la CLI siguen sin dependencias; el panel añade dos crates (§3).
 
 ---
 
@@ -306,7 +306,7 @@ Entorno: Rust 1.99.1, Zig 0.17.1, perfil `release`, 20/11/2026.
 | 8 | Windows x64 | 199.680 B (195,0 KiB) | +512 B | 0 |
 | 8 | Windows x86 | 188.928 B (184,5 KiB) | −512 B | 0 |
 | 8 | Windows ARM64 | 189.440 B (185,0 KiB) | +512 B | 0 |
-| 9 | **Linux x86_64** | **671.648 B (656,1 KiB)** | **+282.416 B** | 2 |
+| 9 | **Linux x86_64** | **671.632 B (656,1 KiB)** | **+282.400 B** | 2 |
 | 9 | **Linux i686** | **738.656 B (721,5 KiB)** | **+315.808 B** | 2 |
 | 9 | **Linux AArch64** | **614.304 B (599,9 KiB)** | **+261.360 B** | 2 |
 | 9 | **Linux ARMv7** | **658.364 B (643,0 KiB)** | **+276.408 B** | 2 |
