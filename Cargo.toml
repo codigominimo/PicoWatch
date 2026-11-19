@@ -2,15 +2,18 @@
 name = "picowatch"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.61"
+rust-version = "1.74"
 license = "MIT"
 description = "Monitor de sistemas extremadamente ligero escrito en Rust"
 readme = "README.md"
 publish = false
 
-# Fase 1: la biblioteca estándar es suficiente. No se añaden dependencias
-# externas hasta que una fase concreta lo justifique por escrito.
+# La CLI y los colectores siguen sin dependencias. La interfaz interactiva
+# (Fase 9) justifica ratatui: dibujar un dashboard con gráficos a mano añadiría
+# más código y riesgo que la propia biblioteca.
 [dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
 
 [profile.release]
 opt-level = "z"

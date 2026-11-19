@@ -577,7 +577,7 @@ mod tests {
         help(&mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(well_formed(&text));
-        assert!(text.contains("\"commands\":[\"status\",\"cpu\""));
+        assert!(text.contains("\"commands\":[\"tui\",\"status\",\"cpu\""));
         assert!(text.contains("\"help\"]"));
         assert_eq!(text.matches("\"name\"").count(), 1);
         for command in Command::ALL {

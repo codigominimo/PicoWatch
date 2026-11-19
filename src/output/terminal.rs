@@ -23,7 +23,11 @@ PicoWatch - monitor de sistemas extremadamente ligero
 
 Uso: picowatch [comando]
 
+  Sin argumentos abre el panel interactivo con gráficas. Pulsa q para salir;
+  +/- cambia el intervalo, r refresca y espacio pausa.
+
 Comandos:
+  tui            Panel interactivo con gráficas (alias: ui; acción por defecto)
   status         Resumen general del sistema
   cpu            Uso de CPU
   memory         Uso de memoria

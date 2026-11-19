@@ -178,7 +178,7 @@ pub fn cpu_core_times() -> io::Result<Vec<(u64, u64, u64)>> {
     }
 
     // `u64` garantiza la alineación de 8 bytes que exigen los LARGE_INTEGER.
-    let mut storage = vec![0u64; (length as usize + 7) / 8];
+    let mut storage = vec![0u64; (length as usize).div_ceil(8)];
     let mut returned = 0u32;
     // SAFETY: el buffer es alineado y tiene exactamente el tamaño que acaba
     // de pedir la API; `returned` apila una variable válida.
@@ -297,7 +297,7 @@ pub fn interfaces() -> io::Result<Vec<crate::collectors::network::Interface>> {
     }
 
     // `u64` garantiza alineación de 8 bytes para la estructura devuelta.
-    let mut storage = vec![0u64; (size as usize + 7) / 8];
+    let mut storage = vec![0u64; (size as usize).div_ceil(8)];
     // SAFETY: el buffer es alineado y tiene el tamaño que acaba de pedir la API.
     let code = unsafe { get_if_table(storage.as_mut_ptr().cast::<c_void>(), &mut size, 0) };
     if code != 0 {

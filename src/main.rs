@@ -1,6 +1,7 @@
 //! Punto de entrada de PicoWatch.
 //!
-//! Fase 6: salida legible o JSON (`--json`) sobre los mismos colectores.
+//! Sin argumentos abre el panel interactivo (ratatui); los comandos siguen
+//! disponibles para guiones, con salida legible o JSON (`--json`).
 
 mod alerts;
 mod cli;
@@ -10,6 +11,7 @@ mod core;
 mod output;
 mod platform;
 mod storage;
+mod tui;
 mod watchdog;
 
 use std::fmt;
@@ -41,9 +43,17 @@ fn run() -> Result<(), Error> {
     let invocation = cli::parse(std::env::args_os().skip(1))?;
     let json = invocation.json;
 
+    // El TUI toma posesión de la terminal: se abre antes de bloquear `stdout`.
+    if invocation.command == Command::Tui {
+        return tui::run().map_err(Error::Io);
+    }
+
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match invocation.command {
+        // Ya se ha devuelto antes de bloquear `stdout`; se repite para que el
+        // match sea exhaustivo sin recurrir a `unreachable!`.
+        Command::Tui => tui::run()?,
         Command::Help => {
             if json {
                 output::json::help(&mut out)?;

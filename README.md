@@ -1,8 +1,8 @@
 # PicoWatch
 
-Monitor de sistemas extremadamente ligero, escrito en Rust estable y sin dependencias externas. Funciona en **Windows y Linux**, en **x86 y ARM**.
+Monitor de sistemas extremadamente ligero, escrito en Rust estable. Funciona en **Windows y Linux**, en **x86 y ARM**. Al ejecutarlo sin argumentos abre un **panel interactivo con gráficas**; los comandos de texto y JSON siguen disponibles para guiones.
 
-**Estado:** Fase 8 completada (limitaciones de Windows eliminadas sin dependencias). 92 pruebas unitarias en verde.
+**Estado:** Fase 9 completada (interfaz TUI con ratatui). 100 pruebas unitarias en verde. Los colectores y la CLI siguen sin dependencias; el panel añade dos crates (§3).
 
 ---
 
@@ -11,12 +11,12 @@ Monitor de sistemas extremadamente ligero, escrito en Rust estable y sin depende
 | Principio | Decisión concreta |
 | --- | --- |
 | Tamaño mínimo | `opt-level = "z"`, LTO, una unidad de código y `strip`. |
-| RAM mínima | Sin frameworks ni runtimes; un solo bloqueo de `stdout` por ejecución. |
-| CPU en reposo | Todo es síncrono; `watch` duerme entre muestras y no crea hilos. |
-| Cero dependencias | Sólo `std`, más declaraciones FFI directas. Ver §3. |
+| RAM mínima | Sin runtimes ni hilos; un solo bloqueo de `stdout` por comando. El TUI mantiene 60 muestras por gráfica (~2 KB). |
+| CPU en reposo | Todo es síncrono; `watch` y el TUI duermen entre muestras y no crean hilos. |
+| Dependencias | Colectores, CLI, JSON y watchdog: sólo `std` + FFI directa. El panel usa `ratatui` y `crossterm` (§3). |
 | Seguridad | Se conserva PIE/RELRO; no se usa `-no-pie` para ahorrar unos bytes. |
 | Simplicidad | Sin `unwrap` en producción, sin estado global. El `unsafe` se limita a FFI justificada. |
-| Portabilidad | Rust 1.61; siete objetivos verificados (§4). |
+| Portabilidad | Rust 1.74 (MSRV de ratatui); siete objetivos verificados (§4). |
 
 `panic = "abort"` reduce el binario y es seguro aquí porque no hay recursos que deban liberarse mediante desenrollado. Los errores de E/S se propagan y se informan por `stderr` con códigos de salida distintos.
 
@@ -66,16 +66,11 @@ picowatch/
 │   │   └── windows.rs     # FFI a kernel32, iphlpapi, ntdll y Toolhelp32 (cfg windows)
 │   ├── storage/
 │   │   └── mod.rs         # historial TSV acotado
+│   ├── tui/
+│   │   └── mod.rs         # panel ratatui: gauges, sparklines, barras y tabla
 │   └── watchdog/
 │       └── mod.rs         # diff() puro + bucle run() con E/S inyectada
 └── README.md
-```
-
-Árbol previsto, añadido sólo cuando la fase correspondiente lo justifique:
-
-```text
-src/
-└── core/        scheduler.rs, events.rs
 ```
 
 Responsabilidades:
@@ -88,13 +83,14 @@ Responsabilidades:
 - **`watchdog`** calcula eventos con `observed` + `diff` sobre mapas ordenados; `run` recibe la lectura, el reposo y el emisor de eventos como closures, así que las pruebas no duermen ni necesitan procesos reales, y el mismo bucle sirve para texto y para JSON.
 - **`platform`** concentra todo el código Windows específico. En Linux los colectores leen directamente con `std::fs`.
 - **`output::terminal`** y **`output::json`** reciben `&mut impl Write`, así que las pruebas usan `Vec<u8>` y `main` hace un único `lock()` de `stdout`. El escritor JSON escapa cadenas y emite porcentajes como enteros; no usa `serde`.
-- **`main`** decide el código de salida: `0` éxito, `1` error de E/S, `2` error de sintaxis.
+- **`tui`** es el único módulo con dependencias externas. `App` concentra el estado de la pantalla (última muestra, históricos acotados, intervalo y pausa); `run` activa la pantalla alternativa, dibuja, sondea eventos 100 ms y restaura la terminal con un guardián `Drop`. Las pruebas dibujan con `TestBackend`, sin terminal real.
+- **`main`** decide el código de salida: `0` éxito, `1` error de E/S, `2` error de sintaxis. Con `tui` activo toma posesión de la terminal antes de bloquear `stdout`.
 
 ---
 
 ## 3. Dependencias y uso de `unsafe`
 
-**Número de dependencias externas: 0** en los siete objetivos.
+**Dependencias externas: 2 directas** (`ratatui 0.29`, `crossterm 0.28`) en los siete objetivos. Hasta la Fase 8 eran cero; la Fase 9 las incorpora de forma explícita para no reescribir un motor de terminal, y documenta el coste medido en §6.
 
 | Alternativa descartada | Problema que resolvía | Por qué no se usa |
 | --- | --- | --- |
@@ -103,10 +99,11 @@ Responsabilidades:
 | `sysinfo` | Métricas del sistema | Arrastre de dependencias y allocations; `/proc`, `/sys` y la API nativa se usan directamente. |
 | `libc` | Llamadas al sistema | Añadiría un crate y una capa que no evita declarar las estructuras (`statvfs`, `PROCESSENTRY32W`) ni las funciones de Windows. Se declaran las catorce funciones necesarias. |
 | `anyhow` / `thiserror` | Errores | Un enum de dos variantes y `From` bastan. |
+| Dibujar la TUI con `std` | Panel con gráficas | Escapes ANSI, layouts, tablas, UTF-8 y eventos de teclado multiplataforma son cientos de líneas frágiles; ratatui + crossterm cuestan ~204 KB (Windows x64) y son la única dependencia nueva. |
 
-Las funciones declaradas mediante FFI son `GetSystemTimes`, `GetProcessTimes`, `GlobalMemoryStatusEx`, `GetDiskFreeSpaceExW`, `GetIfTable`, `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW`, `OpenProcess`, `K32GetProcessMemoryInfo`, `CloseHandle` y `NtQuerySystemInformation` (Windows), y `statvfs` y `sysconf` (Linux). Todas son API del sistema: no se añade ningún crate ni DLL externa. `std` no expone estas métricas y la alternativa de lanzar `wmic`/`tasklist`/`df`/PowerShell sería lenta, dependiente de la configuración regional y frágil. Cada bloque `unsafe` está acompañado de un comentario `SAFETY`; no hay `unsafe` en el parseo ni en la lógica de presentación. Los handles se cierran siempre, incluso cuando falla alguna de las dos consultas por proceso, que comparten un único `OpenProcess`.
+Las funciones declaradas mediante FFI son `GetSystemTimes`, `GetProcessTimes`, `GlobalMemoryStatusEx`, `GetDiskFreeSpaceExW`, `GetIfTable`, `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW`, `OpenProcess`, `K32GetProcessMemoryInfo`, `CloseHandle` y `NtQuerySystemInformation` (Windows), y `statvfs` y `sysconf` (Linux). Todas son API del sistema: no se añade ninguna DLL externa. `std` no expone estas métricas y la alternativa de lanzar `wmic`/`tasklist`/`df`/PowerShell sería lenta, dependiente de la configuración regional y frágil. Cada bloque `unsafe` está acompañado de un comentario `SAFETY`; no hay `unsafe` en el parseo ni en la lógica de presentación. Los handles se cierran siempre, incluso cuando falla alguna de las dos consultas por proceso, que comparten un único `OpenProcess`.
 
-Criterio para incorporar cualquier dependencia futura: describir el problema, demostrar que implementarlo directamente no es fiable, medir el incremento de binario y de RAM, y documentarlo aquí antes del `Cargo.toml`.
+Criterio para incorporar cualquier dependencia futura: describir el problema, demostrar que implementarlo directamente no es fiable, medir el incremento de binario y de RAM, y documentarlo aquí antes del `Cargo.toml`. La Fase 9 siguió exactamente ese criterio: el TUI se dibuja y se prueba con `TestBackend` antes de medir los siete binarios (§6). `cargo tree -e normal --depth 1` confirma que sólo hay dos dependencias directas.
 
 ---
 
@@ -149,14 +146,15 @@ cargo build --release --target x86_64-unknown-linux-gnu
 cargo test --all-targets
 ```
 
-La compilación estática se eligió para Linux porque el monitor no necesita NSS/DNS. Se reevaluará en la Fase 7 frente a la dinámica, que podría ser menor.
+La compilación estática se eligió para Linux porque el monitor no necesita NSS/DNS; la medición de la Fase 7 confirmó que era la opción correcta y se conserva en la Fase 9.
 
 ---
 
 ## 5. Uso
 
 ```text
-picowatch                  Muestra la ayuda
+picowatch                  Abre el panel interactivo (TUI) con gráficas
+picowatch tui | ui         Lo mismo, explícitamente
 picowatch help             Muestra la ayuda
 picowatch -h | --help      Muestra la ayuda
 picowatch version          Muestra la versión
@@ -177,13 +175,15 @@ picowatch history [--last N]
 picowatch [--json] comando  Emite JSON en lugar de texto legible
 ```
 
+En el panel, `q` o `Esc` salen, `+`/`-` ajustan el intervalo (0,5-30 s), `r` fuerza un refresco y la barra espaciadora pausa. Los gráficos son histogramas de CPU (sparkline +gauge), uso por núcleo (barras), memoria, disco y tráfico RX/TX; debajo están el top de procesos y las alertas. Todo se dibuja con los mismos colectores que `status`, sin hilos.
+
 `network`, `watch` e `history` se añaden a la lista de ejemplos del enunciado para exponer de forma independiente los módulos de red, vigilancia e historial. En `watch`, `--interval` vale 1000 ms por defecto y `--ticks 0` (por defecto) vigila hasta que se interrumpa el proceso.
 
 `--json` es global: se acepta antes o después del comando (`picowatch --json cpu` o `picowatch cpu --json`) y afecta a todos los comandos. Los porcentajes se emiten como puntos base enteros (`5000` = 50,00 %), sin coma flotante. `watch` usa JSON Lines: una línea para la cabecera y una por evento.
 
 `status` escribe una muestra en el historial y evalúa las alertas. El archivo de configuración se crea con `config init`; hasta entonces se usan los valores por defecto. En Windows queda en `%APPDATA%\PicoWatch\config.txt` y en Linux en `$XDG_CONFIG_HOME/picowatch/config` (o `~/.config/picowatch/config`). El historial se guarda como `history.log` junto a él, o en la ruta que indique `history_path`. `history_enabled=false` desactiva la escritura.
 
-Códigos de salida: `0` correcto, `1` error de E/S, `2` error de sintaxis. `cpu` toma dos muestras separadas 100 ms; `processes` también en Linux (en Windows una sola, pues no hay CPU por proceso); `watch` duerme entre muestras. Ningún comando crea hilos.
+Códigos de salida: `0` correcto, `1` error de E/S, `2` error de sintaxis. `cpu` y `processes` toman dos muestras separadas 100 ms en ambas plataformas (Fase 8); `watch` duerme entre muestras. Ningún comando crea hilos.
 
 Ejemplo en Linux:
 
@@ -254,7 +254,7 @@ de E/S.
 
 ### Tamaños medidos
 
-Entorno: Rust 1.99.1, Zig 0.17.1, perfil `release`, 19/11/2026.
+Entorno: Rust 1.99.1, Zig 0.17.1, perfil `release`, 20/11/2026.
 
 | Fase | Objetivo | Tamaño | Δ fase anterior | Dependencias |
 | --- | --- | ---: | ---: | ---: |
@@ -299,15 +299,22 @@ Entorno: Rust 1.99.1, Zig 0.17.1, perfil `release`, 19/11/2026.
 | 7 | Windows x64 | 199.168 B (194,5 KiB) | 0 B | 0 |
 | 7 | Windows x86 | 189.440 B (185,0 KiB) | 0 B | 0 |
 | 7 | Windows ARM64 | 188.928 B (184,5 KiB) | 0 B | 0 |
-| 8 | **Linux x86_64** | **389.232 B (380,1 KiB)** | **+192 B** | 0 |
-| 8 | **Linux i686** | **422.848 B (412,9 KiB)** | **0 B** | 0 |
-| 8 | **Linux AArch64** | **352.944 B (344,7 KiB)** | **−16 B** | 0 |
-| 8 | **Linux ARMv7** | **381.956 B (373,0 KiB)** | **−80 B** | 0 |
-| 8 | **Windows x64** | **199.680 B (195,0 KiB)** | **+512 B** | 0 |
-| 8 | **Windows x86** | **188.928 B (184,5 KiB)** | **−512 B** | 0 |
-| 8 | **Windows ARM64** | **189.440 B (185,0 KiB)** | **+512 B** | 0 |
+| 8 | Linux x86_64 | 389.232 B (380,1 KiB) | +192 B | 0 |
+| 8 | Linux i686 | 422.848 B (412,9 KiB) | 0 B | 0 |
+| 8 | Linux AArch64 | 352.944 B (344,7 KiB) | −16 B | 0 |
+| 8 | Linux ARMv7 | 381.956 B (373,0 KiB) | −80 B | 0 |
+| 8 | Windows x64 | 199.680 B (195,0 KiB) | +512 B | 0 |
+| 8 | Windows x86 | 188.928 B (184,5 KiB) | −512 B | 0 |
+| 8 | Windows ARM64 | 189.440 B (185,0 KiB) | +512 B | 0 |
+| 9 | **Linux x86_64** | **671.648 B (656,1 KiB)** | **+282.416 B** | 2 |
+| 9 | **Linux i686** | **738.656 B (721,5 KiB)** | **+315.808 B** | 2 |
+| 9 | **Linux AArch64** | **614.304 B (599,9 KiB)** | **+261.360 B** | 2 |
+| 9 | **Linux ARMv7** | **658.364 B (643,0 KiB)** | **+276.408 B** | 2 |
+| 9 | **Windows x64** | **403.968 B (394,5 KiB)** | **+204.288 B** | 2 |
+| 9 | **Windows x86** | **393.728 B (384,5 KiB)** | **+204.800 B** | 2 |
+| 9 | **Windows ARM64** | **386.048 B (377,0 KiB)** | **+196.608 B** | 2 |
 
-El descenso de Windows x64 en la Fase 3 respecto a la Fase 2 vino de un refactor del formateo de porcentajes, no de un cambio de perfil. La Fase 4 añadió el colector de procesos y el watchdog; la Fase 5, configuración, historial y alertas; la Fase 6, el escritor JSON; la Fase 8, el desglose de CPU por núcleo y por proceso en Windows. Siete objetivos siguen por debajo de 425 KB y el coste total de JSON fue un 2-4 % del binario. **Ninguna optimización se declarará exitosa sin medición.**
+El descenso de Windows x64 en la Fase 3 respecto a la Fase 2 vino de un refactor del formateo de porcentajes, no de un cambio de perfil. La Fase 4 añadió el colector de procesos y el watchdog; la Fase 5, configuración, historial y alertas; la Fase 6, el escritor JSON; la Fase 8, el desglose de CPU por núcleo y por proceso en Windows; la Fase 9, el panel con gráficas. El coste medido del TUI es de ~0,2-0,3 MB (un 70-100 % sobre la Fase 8), pero los siete binarios siguen por debajo de 750 KB y muy lejos del límite de 1-3 MB del proyecto. Los comandos de texto no pagan ningún coste de ejecución adicional: ratatui sólo se inicializa al abrir el panel. **Ninguna optimización se declarará exitosa sin medición.**
 
 ### Procedimiento de RAM, CPU y arranque
 
@@ -332,18 +339,25 @@ Resultados reales en este entorno, Windows x64, 30 iteraciones:
 
 | Comando | Pared (ms) | CPU (ms) | RAM pico (KiB) | Salida |
 | --- | ---: | ---: | ---: | ---: |
-| `version` (arranque) | 25,74 (mediana; mín. 24,69) | 0,00 | 2.168 | 16 B |
-| `help` | 28,88 | 0,00 | 3.488 | 1.039 B |
-| `cpu` (12 núcleos) | 128,12 | 15,63 | 3.528 | 195 B |
-| `memory` | 27,87 | 0,00 | 3.380 | 81 B |
-| `disk` | 27,70 | 0,00 | 3.248 | 79 B |
-| `temperature` | 28,77 | 0,00 | 2.036 | 38 B, exit 0 |
-| `network` | 32,94 | 15,63 | 2.996 | 3.568 B |
-| `processes` (268 proc.) | 152,05 | 31,25 | 3.840 | 16.810 B |
-| `status` | 131,12 | 0,00 | 3.268 | 462 B |
-| `status --json` | 131,38 | 0,00 | 3.268 | 4.586 B |
+| `version` (arranque) | 28,06 (mediana; mín. 26,36) | 15,63 | 3.472 | 16 B |
+| `help` | 29,92 | 0,00 | 3.048 | 1.255 B |
+| `cpu` (12 núcleos) | 130,31 | 0,00 | 3.988 | 198 B |
+| `memory` | 31,32 | 15,63 | 4.460 | 81 B |
+| `disk` | 31,53 | 0,00 | 3.728 | 79 B |
+| `temperature` | 31,33 | 0,00 | 3.212 | 38 B, exit 0 |
+| `network` | 32,71 | 31,25 | 4.260 | 3.568 B |
+| `processes` (268 proc.) | 153,92 | 31,25 | 4.748 | 16.678 B |
+| `status` | 136,40 | 0,00 | 4.128 | 461 B |
+| `status --json` | 133,71 | 0,00 | 4.132 | 4.567 B |
 
-El reloj de CPU de Windows tiene una granularidad de ~15,6 ms, de ahí los valores discretos. `cpu`, `processes` y `status` incluyen la espera deliberada de 100 ms entre muestras; el sobrecoste real de JSON frente a `status` legible es de ~0,3 ms y 4 KB de salida. La RAM son ~2-4 MB de huella del proceso Windows (CRT y pila), no del heap de la aplicación. `processes` pasó de 42 ms a 152 ms en la Fase 8: el cálculo de CPU por proceso exige una segunda muestra, igual que en Linux, y se hace en el mismo hilo.
+El reloj de CPU de Windows tiene una granularidad de ~15,6 ms, de ahí los valores discretos. `cpu`, `processes` y `status` incluyen la espera deliberada de 100 ms entre muestras; el sobrecoste de JSON frente a `status` legible no es medible y añade 4 KB de salida. La RAM son ~3-5 MB de huella del proceso Windows (CRT, pila y las tablas de ratatui enlazadas), no del heap de la aplicación: subió ~0,8 MB respecto a la Fase 8 por las dos dependencias nuevas, incluso en comandos que no las usan, porque el enlazador las incluye en el mismo ejecutable. El panel en ejecución se midió aparte: tras 1,5 s seguía activo y refrescando, con 12 gráficas de núcleo, sparklines de red y el top de procesos.
+
+Decisiones de la Fase 9, verificadas con medición:
+
+- `ratatui 0.29` + `crossterm 0.28` son las únicas dependencias: ~205 KB en Windows x64 y ~0,26-0,32 MB en Linux. Se acepta el coste a cambio de no mantener un motor de terminal propio.
+- El panel no crea hilos: dos muestras de 100 ms por refrescado (CPU y procesos) y `event::poll(100 ms)`. El intervalo por defecto es 1 s y se ajusta de 0,5 a 30 s con `+`/`-`.
+- El histórico se acota a 60 muestras por gráfica con `VecDeque`, y las pruebas de render usan `TestBackend`: el panel se verifica sin terminal real ni escribir a mano secuencias ANSI.
+- La opción por defecto pasó de «ayuda» a «panel», porque la petición fue explícita: no hay que escribir comandos para ver el monitor.
 
 Decisiones de la Fase 8, verificadas con medición:
 
@@ -374,6 +388,7 @@ Los binarios de Linux se generan por enlazado cruzado: el subsistema WSL de este
 | 6 | Salida JSON y pruebas | ✅ Completada |
 | 7 | Optimización extrema y benchmarking | ✅ Completada |
 | 8 | Limitaciones de Windows: CPU por núcleo y por proceso | ✅ Completada |
+| 9 | Interfaz TUI con gráficas (ratatui), panel por defecto | ✅ Completada |
 
 No se avanza de fase hasta que la anterior funcione y tenga pruebas. La salida JSON se produce con `--json` y convive con la legible: comparten colectores y `main` sólo elige el formateador. La única limitación de plataforma que queda es la temperatura en Windows, por carecer de API ligera; se informa como «sin sensores disponibles» sin provocar un error.
 

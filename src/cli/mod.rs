@@ -11,6 +11,8 @@ use std::str::FromStr;
 /// Comandos reconocidos por la CLI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Panel interactivo con gráficas: es la acción por defecto.
+    Tui,
     Status,
     Cpu,
     Memory,
@@ -27,7 +29,8 @@ pub enum Command {
 
 impl Command {
     /// Todos los comandos, en el orden en que se muestran en la ayuda.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
+        Self::Tui,
         Self::Status,
         Self::Cpu,
         Self::Memory,
@@ -45,6 +48,7 @@ impl Command {
     /// Representación canónica del comando (también usada por `Display`).
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Tui => "tui",
             Self::Status => "status",
             Self::Cpu => "cpu",
             Self::Memory => "memory",
@@ -144,7 +148,8 @@ impl fmt::Display for ParseError {
 
 /// Parsea los argumentos **sin** incluir el nombre del programa.
 ///
-/// Sin argumentos se muestra la ayuda, comportamiento habitual en CLI.
+/// Sin argumentos se abre el panel interactivo (`tui`). La CLI sigue disponible
+/// para guiones y entornos sin terminal.
 /// `--json` es una opción global: se acepta antes o después del comando y se
 /// elimina de los argumentos que recibe cada subcomando. Sólo `watch`,
 /// `config` e `history` conservan argumentos propios.
@@ -160,8 +165,10 @@ where
             Some(arg) if arg.as_ref() == "--json" => json = true,
             Some(arg) => break arg,
             None => {
+                // Sin argumentos se abre directamente el panel interactivo:
+                // es la forma habitual de usar un monitor en pantalla completa.
                 return Ok(Invocation {
-                    command: Command::Help,
+                    command: Command::Tui,
                     arguments: Vec::new(),
                     json,
                 });
@@ -170,6 +177,7 @@ where
     };
 
     let command = match first.as_ref() {
+        arg if arg == "tui" || arg == "ui" => Command::Tui,
         arg if arg == "status" => Command::Status,
         arg if arg == "cpu" => Command::Cpu,
         arg if arg == "memory" => Command::Memory,
@@ -317,16 +325,18 @@ mod tests {
     };
 
     #[test]
-    fn sin_argumentos_muestra_ayuda() {
+    fn sin_argumentos_abre_el_panel() {
         assert_eq!(
             parse(std::iter::empty::<&str>()),
-            Ok(Invocation::from(Command::Help))
+            Ok(Invocation::from(Command::Tui))
         );
     }
 
     #[test]
     fn reconoce_todos_los_comandos() {
         let casos = [
+            ("tui", Command::Tui),
+            ("ui", Command::Tui),
             ("status", Command::Status),
             ("cpu", Command::Cpu),
             ("memory", Command::Memory),
@@ -437,7 +447,7 @@ mod tests {
         assert_eq!(
             parse(["--json"]),
             Ok(Invocation {
-                command: Command::Help,
+                command: Command::Tui,
                 arguments: Vec::new(),
                 json: true,
             })
@@ -447,7 +457,7 @@ mod tests {
 
     #[test]
     fn todos_los_comandos_estan_en_la_lista() {
-        assert_eq!(Command::ALL.len(), 12);
+        assert_eq!(Command::ALL.len(), 13);
         for command in Command::ALL {
             assert_eq!(parse([command.as_str()]).unwrap().command, command);
         }
