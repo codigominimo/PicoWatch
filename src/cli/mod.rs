@@ -26,6 +26,22 @@ pub enum Command {
 }
 
 impl Command {
+    /// Todos los comandos, en el orden en que se muestran en la ayuda.
+    pub const ALL: [Self; 12] = [
+        Self::Status,
+        Self::Cpu,
+        Self::Memory,
+        Self::Disk,
+        Self::Temperature,
+        Self::Network,
+        Self::Processes,
+        Self::Watch,
+        Self::Config,
+        Self::History,
+        Self::Version,
+        Self::Help,
+    ];
+
     /// Representación canónica del comando (también usada por `Display`).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -56,11 +72,13 @@ impl fmt::Display for Command {
     }
 }
 
-/// Comando más sus argumentos sin analizar.
+/// Comando, argumentos sin analizar y formato de salida elegido.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub command: Command,
     pub arguments: Vec<OsString>,
+    /// `--json` puede ir antes o después del comando.
+    pub json: bool,
 }
 
 impl From<Command> for Invocation {
@@ -68,6 +86,7 @@ impl From<Command> for Invocation {
         Self {
             command,
             arguments: Vec::new(),
+            json: false,
         }
     }
 }
@@ -125,17 +144,29 @@ impl fmt::Display for ParseError {
 
 /// Parsea los argumentos **sin** incluir el nombre del programa.
 ///
-/// Sin argumentos se muestra la ayuda, comportamiento habitual en CLI. Sólo
-/// `watch` conserva argumentos; el resto los rechaza como antes.
+/// Sin argumentos se muestra la ayuda, comportamiento habitual en CLI.
+/// `--json` es una opción global: se acepta antes o después del comando y se
+/// elimina de los argumentos que recibe cada subcomando. Sólo `watch`,
+/// `config` e `history` conservan argumentos propios.
 pub fn parse<I, S>(args: I) -> Result<Invocation, ParseError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     let mut iter = args.into_iter();
-    let first = match iter.next() {
-        Some(arg) => arg,
-        None => return Ok(Command::Help.into()),
+    let mut json = false;
+    let first = loop {
+        match iter.next() {
+            Some(arg) if arg.as_ref() == "--json" => json = true,
+            Some(arg) => break arg,
+            None => {
+                return Ok(Invocation {
+                    command: Command::Help,
+                    arguments: Vec::new(),
+                    json,
+                });
+            }
+        }
     };
 
     let command = match first.as_ref() {
@@ -154,16 +185,25 @@ where
         other => return Err(ParseError::UnknownCommand(other.to_os_string())),
     };
 
-    let rest: Vec<OsString> = iter.map(|arg| arg.as_ref().to_os_string()).collect();
+    let mut arguments: Vec<OsString> = Vec::new();
+    for arg in iter {
+        let raw = arg.as_ref();
+        if raw == "--json" {
+            json = true;
+        } else {
+            arguments.push(raw.to_os_string());
+        }
+    }
     if !command.takes_arguments() {
-        if let Some(extra) = rest.first() {
+        if let Some(extra) = arguments.first() {
             return Err(ParseError::UnexpectedArgument(extra.clone()));
         }
     }
 
     Ok(Invocation {
         command,
-        arguments: rest,
+        arguments,
+        json,
     })
 }
 
@@ -326,6 +366,7 @@ mod tests {
             Ok(Invocation {
                 command: Command::Watch,
                 arguments: vec!["init".into(), "--ticks".into(), "2".into()],
+                json: false,
             })
         );
     }
@@ -371,12 +412,45 @@ mod tests {
 
     #[test]
     fn rechaza_argumentos_extra() {
-        let error = parse(["cpu", "--json"]).unwrap_err();
+        let error = parse(["cpu", "--foo"]).unwrap_err();
         assert_eq!(
             error,
-            ParseError::UnexpectedArgument("--json".into()),
+            ParseError::UnexpectedArgument("--foo".into()),
             "error: {error}"
         );
+    }
+
+    #[test]
+    fn json_acepta_antes_y_despues_del_comando() {
+        for args in [
+            vec!["--json", "status"],
+            vec!["status", "--json"],
+            vec!["--json", "watch", "--json", "--ticks", "1", "init"],
+        ] {
+            let invocation = parse(args.clone()).unwrap();
+            assert!(invocation.json, "argumentos: {args:?}");
+            assert!(
+                !invocation.arguments.iter().any(|arg| arg == "--json"),
+                "--json no debe filtrarse al subcomando"
+            );
+        }
+        assert_eq!(
+            parse(["--json"]),
+            Ok(Invocation {
+                command: Command::Help,
+                arguments: Vec::new(),
+                json: true,
+            })
+        );
+        assert!(!parse(["status"]).unwrap().json);
+    }
+
+    #[test]
+    fn todos_los_comandos_estan_en_la_lista() {
+        assert_eq!(Command::ALL.len(), 12);
+        for command in Command::ALL {
+            assert_eq!(parse([command.as_str()]).unwrap().command, command);
+        }
     }
 
     #[test]

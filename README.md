@@ -2,7 +2,7 @@
 
 Monitor de sistemas extremadamente ligero, escrito en Rust estable y sin dependencias externas. Funciona en **Windows y Linux**, en **x86 y ARM**.
 
-**Estado:** Fase 5 completada (configuración, historial y alertas). 76 pruebas unitarias en verde.
+**Estado:** Fase 6 completada (salida legible y JSON, sin dependencias). 88 pruebas unitarias en verde.
 
 ---
 
@@ -58,6 +58,7 @@ picowatch/
 │   │   └── mod.rs         # NAME, VERSION (constantes compile-time)
 │   ├── output/
 │   │   ├── mod.rs
+│   │   ├── json.rs        # escritor JSON mínimo + StatusView
 │   │   └── terminal.rs    # funciones Write genérico para todos los comandos
 │   ├── platform/
 │   │   ├── mod.rs
@@ -73,20 +74,19 @@ picowatch/
 
 ```text
 src/
-├── core/        scheduler.rs, events.rs
-└── output/      json.rs
+└── core/        scheduler.rs, events.rs
 ```
 
 Responsabilidades:
 
-- **`cli`** son funciones puras sobre iteradores de `OsStr`: no leen `std::env` y se prueban sin efectos laterales. `parse` devuelve comando + argumentos; `parse_watch`, `parse_config` y `parse_history` validan las opciones.
+- **`cli`** son funciones puras sobre iteradores de `OsStr`: no leen `std::env` y se prueban sin efectos laterales. `parse` devuelve comando + argumentos + el flag `--json` (que admite antes o después del comando); `parse_watch`, `parse_config` y `parse_history` validan las opciones.
 - **`collectors`** separa el parseo puro (`parse_snapshot`, `parse_meminfo`, `parse_temperature`, `parse_netdev`, `parse_stat`) de la lectura del sistema. Las pruebas usan texto sintético y funcionan en cualquier host. Los porcentajes usan enteros en centésimas (`basis_points`), sin `f64`.
 - **`config`** parsea `clave=valor` con `parse()` puro; `load()` usa los valores por defecto si no hay archivo. La ruta depende de `APPDATA` (Windows) o `XDG_CONFIG_HOME`/`HOME` (Linux), con retroceso al directorio actual.
 - **`storage`** guarda el historial en TSV, con `format_line`/`parse_line` puros y `append` acotado a `history_max` líneas. Una línea corrupta se ignora sin bloquear las muestras nuevas.
 - **`alerts`** es una función pura que compara métricas con umbrales; no imprime ni lee archivos.
-- **`watchdog`** calcula eventos con `observed` + `diff` sobre mapas ordenados; `run` recibe la lectura y el reposo como closures, así que las pruebas no duermen ni necesitan procesos reales.
+- **`watchdog`** calcula eventos con `observed` + `diff` sobre mapas ordenados; `run` recibe la lectura, el reposo y el emisor de eventos como closures, así que las pruebas no duermen ni necesitan procesos reales, y el mismo bucle sirve para texto y para JSON.
 - **`platform`** concentra todo el código Windows específico. En Linux los colectores leen directamente con `std::fs`.
-- **`output::terminal`** recibe `&mut impl Write`, así que las pruebas usan `Vec<u8>` y `main` hace un único `lock()` de `stdout`.
+- **`output::terminal`** y **`output::json`** reciben `&mut impl Write`, así que las pruebas usan `Vec<u8>` y `main` hace un único `lock()` de `stdout`. El escritor JSON escapa cadenas y emite porcentajes como enteros; no usa `serde`.
 - **`main`** decide el código de salida: `0` éxito, `1` error de E/S, `2` error de sintaxis.
 
 ---
@@ -98,7 +98,7 @@ Responsabilidades:
 | Alternativa descartada | Problema que resolvía | Por qué no se usa |
 | --- | --- | --- |
 | `clap` | Parseo de CLI | Cientos de KiB y asignaciones para comandos fijos. |
-| `serde` / `serde_json` | Salida JSON | Se implementará un escritor mínimo en la Fase 6. |
+| `serde` / `serde_json` | Salida JSON | Se resolvió en la Fase 6 con `output::json`: ~7-12 KB frente a cientos de KiB. |
 | `sysinfo` | Métricas del sistema | Arrastre de dependencias y allocations; `/proc`, `/sys` y la API nativa se usan directamente. |
 | `libc` | Llamadas al sistema | Añadiría un crate y una capa que no evita declarar las estructuras (`statvfs`, `PROCESSENTRY32W`) ni las funciones de Windows. Se declaran las doce funciones necesarias. |
 | `anyhow` / `thiserror` | Errores | Un enum de dos variantes y `From` bastan. |
@@ -173,9 +173,12 @@ picowatch config [show|path|init]
                            Muestra la configuración, su ruta o la crea
 picowatch history [--last N]
                            Últimas N muestras (por defecto 10)
+picowatch [--json] comando  Emite JSON en lugar de texto legible
 ```
 
 `network`, `watch` e `history` se añaden a la lista de ejemplos del enunciado para exponer de forma independiente los módulos de red, vigilancia e historial. En `watch`, `--interval` vale 1000 ms por defecto y `--ticks 0` (por defecto) vigila hasta que se interrumpa el proceso.
+
+`--json` es global: se acepta antes o después del comando (`picowatch --json cpu` o `picowatch cpu --json`) y afecta a todos los comandos. Los porcentajes se emiten como puntos base enteros (`5000` = 50,00 %), sin coma flotante. `watch` usa JSON Lines: una línea para la cabecera y una por evento.
 
 `status` escribe una muestra en el historial y evalúa las alertas. El archivo de configuración se crea con `config init`; hasta entonces se usan los valores por defecto. En Windows queda en `%APPDATA%\PicoWatch\config.txt` y en Linux en `$XDG_CONFIG_HOME/picowatch/config` (o `~/.config/picowatch/config`). El historial se guarda como `history.log` junto a él, o en la ruta que indique `history_path`. `history_enabled=false` desactiva la escritura.
 
@@ -200,6 +203,13 @@ $ picowatch history --last 2
 Historial (2 muestras):
   1795128379 CPU 8.33% MEM 95.00% DISCO 38.51% RED 3 TEMP 45.2 °C
   1795128380 CPU 4.16% MEM 94.80% DISCO 38.51% RED 3 TEMP 45.1 °C
+```
+
+El mismo `status` con `--json`:
+
+```console
+$ picowatch --json status
+{"cpu":{"usage_basis_points":416,"core_count":2,"cores":[310,520]},"memory":{"total_bytes":17179869184,"available_bytes":8589934592,"used_bytes":8589934592,"used_basis_points":5000},"disk":{"volume":"/","total_bytes":512000000000,"available_bytes":315000000000,"used_bytes":197000000000,"used_basis_points":3846},"network":{"interfaces":[{"name":"lo","rx_bytes":12345,"tx_bytes":67890},{"name":"eth0","rx_bytes":1000000,"tx_bytes":2000000}]},"temperature":{"sensors":[{"name":"thermal_zone0","millicelsius":45200}]},"alerts":[]}
 ```
 
 Ejemplo en Windows:
@@ -253,15 +263,22 @@ Entorno: Rust 1.99.1, Zig 0.17.1, perfil `release`, 19/11/2026.
 | 4 | Windows x64 | 153.600 B (150,0 KiB) | +17.408 B | 0 |
 | 4 | Windows x86 | 144.384 B (141,0 KiB) | +16.896 B | 0 |
 | 4 | Windows ARM64 | 147.968 B (144,5 KiB) | +16.384 B | 0 |
-| 5 | **Linux x86_64** | **379.656 B (370,8 KiB)** | **+20.480 B** | 0 |
-| 5 | **Linux i686** | **410.176 B (400,6 KiB)** | **+27.144 B** | 0 |
-| 5 | **Linux AArch64** | **344.344 B (336,3 KiB)** | **+18.280 B** | 0 |
-| 5 | **Linux ARMv7** | **371.460 B (362,8 KiB)** | **+24.140 B** | 0 |
-| 5 | **Windows x64** | **190.976 B (186,5 KiB)** | **+37.376 B** | 0 |
-| 5 | **Windows x86** | **181.248 B (177,0 KiB)** | **+36.864 B** | 0 |
-| 5 | **Windows ARM64** | **181.760 B (177,5 KiB)** | **+33.792 B** | 0 |
+| 5 | Linux x86_64 | 379.656 B (370,8 KiB) | +20.480 B | 0 |
+| 5 | Linux i686 | 410.176 B (400,6 KiB) | +27.144 B | 0 |
+| 5 | Linux AArch64 | 344.344 B (336,3 KiB) | +18.280 B | 0 |
+| 5 | Linux ARMv7 | 371.460 B (362,8 KiB) | +24.140 B | 0 |
+| 5 | Windows x64 | 190.976 B (186,5 KiB) | +37.376 B | 0 |
+| 5 | Windows x86 | 181.248 B (177,0 KiB) | +36.864 B | 0 |
+| 5 | Windows ARM64 | 181.760 B (177,5 KiB) | +33.792 B | 0 |
+| 6 | **Linux x86_64** | **388.824 B (379,7 KiB)** | **+9.168 B** | 0 |
+| 6 | **Linux i686** | **422.624 B (412,7 KiB)** | **+12.448 B** | 0 |
+| 6 | **Linux AArch64** | **352.696 B (344,4 KiB)** | **+8.352 B** | 0 |
+| 6 | **Linux ARMv7** | **381.492 B (372,6 KiB)** | **+10.032 B** | 0 |
+| 6 | **Windows x64** | **199.168 B (194,5 KiB)** | **+8.192 B** | 0 |
+| 6 | **Windows x86** | **189.440 B (185,0 KiB)** | **+8.192 B** | 0 |
+| 6 | **Windows ARM64** | **188.928 B (184,5 KiB)** | **+7.168 B** | 0 |
 
-El descenso de Windows x64 en la Fase 3 respecto a la Fase 2 vino de un refactor del formateo de porcentajes, no de un cambio de perfil. La Fase 4 añadió el colector de procesos y el watchdog; la Fase 5, configuración, historial y alertas. Todas las cifras siguen lejos del límite de 1-3 MB. **Ninguna optimización se declarará exitosa sin medición.**
+El descenso de Windows x64 en la Fase 3 respecto a la Fase 2 vino de un refactor del formateo de porcentajes, no de un cambio de perfil. La Fase 4 añadió el colector de procesos y el watchdog; la Fase 5, configuración, historial y alertas; la Fase 6, el escritor JSON. Todas las cifras siguen lejos del límite de 1-3 MB y el coste de JSON fue un 2-4 % del binario. **Ninguna optimización se declarará exitosa sin medición.**
 
 ### Procedimiento de RAM, CPU y arranque
 
@@ -293,10 +310,10 @@ Estas cifras se automatizarán en la Fase 7. En este entorno sólo se han ejecut
 | 3 | Discos, temperatura y red | ✅ Completada |
 | 4 | Procesos y watchdog | ✅ Completada |
 | 5 | Configuración, historial y alertas | ✅ Completada |
-| 6 | Salida JSON y pruebas | ⏳ Pendiente |
+| 6 | Salida JSON y pruebas | ✅ Completada |
 | 7 | Optimización extrema y benchmarking | ⏳ Pendiente |
 
-No se avanza de fase hasta que la anterior funcione y tenga pruebas. La salida JSON se incorporará en la Fase 6; hasta entonces sólo existe salida legible.
+No se avanza de fase hasta que la anterior funcione y tenga pruebas. La salida JSON se produce con `--json` y convive con la legible: comparten colectores y `main` sólo elige el formateador.
 
 ---
 

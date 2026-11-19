@@ -1,3 +1,4 @@
-//! Formatos de salida. `json` se añadirá en la Fase 6.
+//! Formatos de salida: legible para humanos y JSON sin dependencias.
 
+pub mod json;
 pub mod terminal;

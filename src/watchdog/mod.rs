@@ -11,7 +11,6 @@ use std::thread;
 use std::time::Duration;
 
 use crate::collectors::processes::Process;
-use crate::output::terminal;
 
 /// Tipo de cambio observado.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,18 +78,28 @@ pub fn diff(previous: &Observed, current: &Observed) -> Vec<Event> {
 }
 
 /// Ejecuta la vigilancia `config.ticks` muestras (o indefinidamente si es 0).
-pub fn run<W, C, S>(config: &Config, mut collect: C, mut sleep: S, out: &mut W) -> io::Result<()>
+///
+/// La lectura, el reposo y el formato de cada evento se inyectan: las pruebas
+/// no duermen y `main` elige entre salida legible y JSON sin duplicar el bucle.
+pub fn run<W, C, S, E>(
+    config: &Config,
+    mut collect: C,
+    mut sleep: S,
+    mut emit: E,
+    out: &mut W,
+) -> io::Result<()>
 where
     W: Write,
     C: FnMut() -> io::Result<Vec<Process>>,
     S: FnMut(Duration),
+    E: FnMut(&mut W, &Event) -> io::Result<()>,
 {
     let mut previous = Observed::new();
     let mut ticks = 0u32;
     loop {
         let current = observed(&collect()?, &config.names);
         for event in diff(&previous, &current) {
-            terminal::watch_event(out, &event)?;
+            emit(out, &event)?;
         }
         previous = current;
 
@@ -112,11 +121,16 @@ pub fn from_options(options: crate::cli::WatchOptions) -> Config {
 }
 
 /// Adaptador para `main`: usa el colector real y `thread::sleep`.
-pub fn run_system<W: Write>(config: &Config, out: &mut W) -> io::Result<()> {
+pub fn run_system_with<W, E>(config: &Config, emit: E, out: &mut W) -> io::Result<()>
+where
+    W: Write,
+    E: FnMut(&mut W, &Event) -> io::Result<()>,
+{
     run(
         config,
         crate::collectors::processes::list,
         thread::sleep,
+        emit,
         out,
     )
 }
@@ -126,6 +140,7 @@ mod tests {
     use super::{diff, from_options, observed, run, Config, Event, Kind, Observed};
     use crate::cli::WatchOptions;
     use crate::collectors::processes::Process;
+    use crate::output::terminal;
     use std::time::Duration;
 
     fn process(pid: u32, name: &str) -> Process {
@@ -199,6 +214,7 @@ mod tests {
                 Ok(sample)
             },
             |duration| slept.push(duration),
+            terminal::watch_event,
             &mut out,
         )
         .unwrap();

@@ -1,6 +1,6 @@
 //! Punto de entrada de PicoWatch.
 //!
-//! Fase 5: configuración, historial y alertas sobre los colectores existentes.
+//! Fase 6: salida legible o JSON (`--json`) sobre los mismos colectores.
 
 mod alerts;
 mod cli;
@@ -39,31 +39,64 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Error> {
     let invocation = cli::parse(std::env::args_os().skip(1))?;
+    let json = invocation.json;
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match invocation.command {
-        Command::Help => output::terminal::help(&mut out)?,
-        Command::Version => output::terminal::version(&mut out)?,
+        Command::Help => {
+            if json {
+                output::json::help(&mut out)?;
+            } else {
+                output::terminal::help(&mut out)?;
+            }
+        }
+        Command::Version => {
+            if json {
+                output::json::version(&mut out)?;
+            } else {
+                output::terminal::version(&mut out)?;
+            }
+        }
         Command::Cpu => {
             let report = collectors::cpu::sample(collectors::cpu::DEFAULT_INTERVAL)?;
-            output::terminal::cpu(&mut out, &report)?;
+            if json {
+                output::json::cpu(&mut out, &report)?;
+            } else {
+                output::terminal::cpu(&mut out, &report)?;
+            }
         }
         Command::Memory => {
             let info = collectors::memory::read()?;
-            output::terminal::memory(&mut out, info)?;
+            if json {
+                output::json::memory(&mut out, info)?;
+            } else {
+                output::terminal::memory(&mut out, info)?;
+            }
         }
         Command::Disk => {
             let info = collectors::disk::read()?;
-            output::terminal::disk(&mut out, info)?;
+            if json {
+                output::json::disk(&mut out, info)?;
+            } else {
+                output::terminal::disk(&mut out, info)?;
+            }
         }
         Command::Temperature => {
             let sensors = collectors::temperature::read()?;
-            output::terminal::temperature(&mut out, &sensors)?;
+            if json {
+                output::json::temperature(&mut out, &sensors)?;
+            } else {
+                output::terminal::temperature(&mut out, &sensors)?;
+            }
         }
         Command::Network => {
             let interfaces = collectors::network::read()?;
-            output::terminal::network(&mut out, &interfaces)?;
+            if json {
+                output::json::network(&mut out, &interfaces)?;
+            } else {
+                output::terminal::network(&mut out, &interfaces)?;
+            }
         }
         Command::Status => {
             let report = collectors::cpu::sample(collectors::cpu::DEFAULT_INTERVAL)?;
@@ -101,45 +134,87 @@ fn run() -> Result<(), Error> {
                 )?;
             }
 
-            output::terminal::status(
-                &mut out,
-                &report,
-                info,
-                disk_info,
-                sensors.as_deref(),
-                &interfaces,
-            )?;
-            output::terminal::alerts(&mut out, &detected, &settings)?;
+            if json {
+                output::json::status(
+                    &mut out,
+                    &output::json::StatusView {
+                        report: &report,
+                        info,
+                        disk: disk_info,
+                        sensors: sensors.as_deref(),
+                        interfaces: &interfaces,
+                        alerts: &detected,
+                        config: &settings,
+                    },
+                )?;
+            } else {
+                output::terminal::status(
+                    &mut out,
+                    &report,
+                    info,
+                    disk_info,
+                    sensors.as_deref(),
+                    &interfaces,
+                )?;
+                output::terminal::alerts(&mut out, &detected, &settings)?;
+            }
         }
         Command::Processes => {
             let processes = collectors::processes::sample(collectors::processes::DEFAULT_INTERVAL)?;
-            output::terminal::processes(&mut out, &processes)?;
+            if json {
+                output::json::processes(&mut out, &processes)?;
+            } else {
+                output::terminal::processes(&mut out, &processes)?;
+            }
         }
         Command::Watch => {
             let options = cli::parse_watch(invocation.arguments)?;
             let interval_ms = options.interval_ms;
             let settings = watchdog::from_options(options);
-            output::terminal::watch_start(&mut out, &settings.names, interval_ms)?;
-            watchdog::run_system(&settings, &mut out)?;
+            if json {
+                output::json::watch_start(&mut out, &settings.names, interval_ms)?;
+                watchdog::run_system_with(&settings, output::json::watch_event, &mut out)?;
+            } else {
+                output::terminal::watch_start(&mut out, &settings.names, interval_ms)?;
+                watchdog::run_system_with(&settings, output::terminal::watch_event, &mut out)?;
+            }
         }
         Command::Config => match cli::parse_config(invocation.arguments)? {
             cli::ConfigAction::Show => {
                 let settings = config::load()?;
-                output::terminal::config(&mut out, &settings, &config::config_path())?;
+                let path = config::config_path();
+                if json {
+                    output::json::config(&mut out, &settings, &path)?;
+                } else {
+                    output::terminal::config(&mut out, &settings, &path)?;
+                }
             }
             cli::ConfigAction::Path => {
-                writeln!(out, "{}", config::config_path().display())?;
+                let path = config::config_path();
+                if json {
+                    output::json::config_path(&mut out, &path)?;
+                } else {
+                    writeln!(out, "{}", path.display())?;
+                }
             }
             cli::ConfigAction::Init => {
                 let path = config::init()?;
-                writeln!(out, "Configuración creada: {}", path.display())?;
+                if json {
+                    output::json::config_path(&mut out, &path)?;
+                } else {
+                    writeln!(out, "Configuración creada: {}", path.display())?;
+                }
             }
         },
         Command::History => {
             let count = cli::parse_history(invocation.arguments)?;
             let settings = config::load()?;
             let records = storage::read_last(&config::history_file(&settings), count)?;
-            output::terminal::history(&mut out, &records)?;
+            if json {
+                output::json::history(&mut out, &records)?;
+            } else {
+                output::terminal::history(&mut out, &records)?;
+            }
         }
     }
     Ok(())
