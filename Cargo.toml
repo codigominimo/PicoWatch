@@ -1,0 +1,20 @@
+[package]
+name = "picowatch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.61"
+license = "MIT"
+description = "Monitor de sistemas extremadamente ligero escrito en Rust"
+readme = "README.md"
+publish = false
+
+# Fase 1: la biblioteca estándar es suficiente. No se añaden dependencias
+# externas hasta que una fase concreta lo justifique por escrito.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
